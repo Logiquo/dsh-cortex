@@ -1,0 +1,21 @@
+{
+  "name": "dsh-cortex",
+  "private": true,
+  "description": "A monorepo of plugins for the DeepSeek Harness (dsh).",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "plugins/*"
+  ],
+  "scripts": {
+    "new": "node scripts/new-plugin.mjs",
+    "build": "node scripts/run-workspaces.mjs build",
+    "typecheck": "node scripts/run-workspaces.mjs typecheck"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3"
+  },
+  "engines": {
+    "node": ">=24.9.0"
+  }
+}

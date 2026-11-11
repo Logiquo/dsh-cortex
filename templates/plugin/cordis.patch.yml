@@ -1,0 +1,11 @@
+# Bundle patch for __PACKAGE__: mounts the plugin with its defaults.
+# Override config from a profile layer if needed:
+#
+#   - set:
+#       - id: __NAME__
+#         config:
+#           enabled: true
+
+- insert:
+    - id: __NAME__
+      name: '__PACKAGE__'

@@ -1,0 +1,25 @@
+# Local reference material (case studies, session dumps) — never committed
+garbage-do-not-search/
+
+# Dependencies and build output
+node_modules/
+lib/
+*.tsbuildinfo
+
+# Packaging and secrets
+.env
+.env.*
+!.env.example
+*.tgz
+.npmrc
+
+# Logs and local dsh traces
+*.log
+.dsh/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
