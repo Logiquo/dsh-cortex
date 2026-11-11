@@ -3,8 +3,8 @@
 //
 //   npm run new -- <name> [--scope @you] [--title "Title"] [--description "..."]
 //
-// <name> is the Cordis plugin id (kebab-case, e.g. "loop-guard").
-// The package is published as <scope>/dsh-<name>, or dsh-<name> without a scope.
+// <name> is the package basename (e.g. "dsh-loop-guard").
+// Folders match the basename; --scope changes only the npm scope.
 import { cpSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,7 +32,7 @@ if (scope && !/^@[a-z0-9][a-z0-9-]*$/.test(scope)) {
   console.error('scope must be an npm scope, e.g. @you')
   process.exit(1)
 }
-const pkg = scope ? `${scope}/dsh-${name}` : `dsh-${name}`
+const pkg = scope ? `${scope}/${name}` : name
 const title = values.title ?? name.split('-').map((w) => w[0].toUpperCase() + w.slice(1)).join(' ')
 const description = values.description ?? `${title} plugin for dsh.`
 

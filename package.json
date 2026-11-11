@@ -10,7 +10,8 @@
   "scripts": {
     "new": "node scripts/new-plugin.mjs",
     "build": "node scripts/run-workspaces.mjs build",
-    "typecheck": "node scripts/run-workspaces.mjs typecheck"
+    "typecheck": "node scripts/run-workspaces.mjs typecheck",
+    "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
     "typescript": "~5.9.3"

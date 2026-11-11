@@ -1,5 +1,6 @@
 # Local reference material (case studies, session dumps) — never committed
 garbage-do-not-search/
+investigations/
 
 # Dependencies and build output
 node_modules/

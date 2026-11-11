@@ -10,18 +10,20 @@ Harness source repository uses pnpm and has its own build pipeline.
 
 ```sh
 npm install
-npm run new -- hello --scope @you --title "Hello"
+npm run new -- dsh-hello --scope @you --title "Hello"
 npm install
 npm run typecheck
 npm run build
 ```
 
-The generator creates `plugins/hello` from `templates/plugin` and copies the MIT
-license. Omit `--scope` to name the package `dsh-hello`. Optional
-`--description` sets the package description.
+The generator creates `plugins/dsh-hello` from `templates/plugin` and copies the MIT
+license. The folder matches the supplied package basename (`dsh-hello`). Scoped
+packages use that same basename as their folder because a scope contains a path
+separator. Omit `--scope` to name the package `dsh-hello`. Optional `--description`
+sets the package description.
 
 ```text
-plugins/<name>/
+plugins/<package-name>/
   src/index.ts       # Cordis name, Config schema, inject, apply
   package.json       # ESM exports and dsh.bundle manifest
   cordis.patch.yml   # inserts the plugin by package name
@@ -40,7 +42,7 @@ only needs Cordis and Schemastery; add agent, tool, or LLM APIs when needed.
 With the dsh CLI installed, build first and link the plugin into a profile:
 
 ```sh
-dsh plugin --profile demo add ./plugins/hello
+dsh plugin --profile demo add ./plugins/dsh-hello
 dsh --profile demo --dump-config
 dsh --profile demo
 ```
@@ -58,6 +60,11 @@ npm pack --workspace @you/dsh-hello
 include JavaScript, declarations, the bundle patch, README, and license.
 This template targets local links and built tarballs or registry packages.
 Git installs of individual monorepo subdirectories are not supported.
+
+## Planned plugins
+
+- [`dsh-ephemeral-reasoning`](plugins/dsh-ephemeral-reasoning/README.md):
+  version-pinned append-time sanitation and meter correction, with real-provider tests.
 
 ## References
 
