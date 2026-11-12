@@ -49,9 +49,11 @@ The default produces a 75,000-token trigger, a 3,750-token brief limit, and a
 targets; the clamp keeps a small `context-limit` from reserving more than the trigger
 it is carved from. The brief includes archive guidance, which is subtracted from the
 brief limit before generation. `briefMaxTokens` bounds only the text that replaces
-history; the generation call takes the route's own response ceiling, so the model's
-configured reasoning effort does not consume the brief budget or truncate the reply.
-Reasoning blocks are neither counted nor retained. Automatic and overflow selection retain
+history. The call that writes the brief is capped at 65,536, the value dsh's own
+compaction uses as its summarization headroom (`headroomTokens`), because that reply
+carries reasoning as well as the brief; capping it at the text budget would truncate
+the brief whenever the configured reasoning effort is high. Reasoning blocks
+are neither counted nor retained. Automatic and overflow selection retain
 the longest balanced recent suffix that fits, possibly none; larger complete
 messages/tool pairs enter the compacted region. Manual compaction uses the host's
 range selection and rejects a retained last message that exceeds the recent-history

@@ -92,8 +92,8 @@ test('a prose brief without prescribed headings commits with searchable original
   assert.match(history, /Original exact fact: violet-42/)
   assert.equal(calls.length, 1)
   assert.equal(calls[0].purpose, 'compaction')
-  // The route's response ceiling bounds the call, not the text budget it replaces.
-  assert.equal(calls[0].maxTokens, 2048)
+  // dsh's summarization headroom caps the call; the text budget does not.
+  assert.equal(calls[0].maxTokens, 65536)
   const logged = await events(ctx, session)
   const summaryIndex = logged.findIndex(e => e.type === 'compaction/summary')
   assert.equal(logged[summaryIndex + 1].type, 'user/message')
@@ -152,6 +152,17 @@ test('empty output fails on the first attempt without losing context', async t =
   // A content verdict cannot be re-asked: retrying would buy the same reply twice.
   assert.equal(calls.length, 1)
   assert.equal(session.surface.replaceGeneration, 0)
+})
+
+test('a tool-calls finish still commits usable text, as the host summarizer does', async t => {
+  // finishError() only rejects error, aborted and max-tokens; any other reason keeps
+  // whatever text the reply carried, so the verdict matches the host summarizer.
+  const { ctx, agent, session, calls } = await fixture(t, {}, { finish: 'tool-calls' })
+  conversation(session, 1)
+  const result = await ctx.compaction.compactNow(agent, new AbortController().signal)
+  assert.ok(result)
+  assert.equal(calls.length, 1)
+  assert.match(result.summary[0].text, /Completion requires those checks to pass/)
 })
 
 test('a summary-error listener drives the only retry path, as in the host summarizer', async t => {

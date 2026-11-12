@@ -3,7 +3,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
 import type { CompactionTrigger, CompactionResult } from '@deepseek-ai/dsh-compaction'
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
-import { BlockAssembler, LlmError, createUserMessage, CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, LlmError, contentHasImage, createUserMessage, CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema, ContentBlock, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session-query'
 import type {} from '@deepseek-ai/dsh-commands'
@@ -186,24 +186,23 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
       messages: [...input.messages, { role: 'user', content: [{ type: 'text', text: briefInstruction(bodyBudget) }] }],
       ...(input.tools === undefined ? {} : { tools: [...input.tools] }),
       toolHistory: agent.session.toolHistory(),
-      // No maxTokens: the call produces reasoning plus the brief, while briefMaxTokens
-      // bounds only the text that replaces history. Capping the call at the text budget
-      // would truncate whenever the route's reasoning effort is high; the response
-      // ceiling belongs to the route.
+      // dsh's summarization headroom. Its own compaction uses this same value as the
+      // summarize call cap (BasicCompactionConfig.headroomTokens), because that reply
+      // carries reasoning as well as the text summary.
+      maxTokens: 65536,
       sessionId: agent.session.id, purpose: 'compaction',
       ...(signal ? { signal } : {}),
     })) assembler.push(chunk)
     signal?.throwIfAborted()
-    const finish = assembler.finish
-    if (finish.kind === 'error' || finish.kind === 'aborted') throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
     // Fail the brief on the first attempt, like the host summarizer. Recovery is its
     // `compaction/summary-error` waterfall: a listener there may change the input and
     // re-run this hook. A content verdict or a truncation cannot be re-asked, so
     // retrying the same request would only pay for the same reply twice.
+    const finish = assembler.finish
+    if (finish.kind === 'error' || finish.kind === 'aborted') throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
     if (finish.kind === 'max-tokens') throw Object.assign(new Error('Execution brief truncated at the token cap (incomplete checkpoint)'), { code: 'MAX_TOKENS' })
-    if (finish.kind !== 'stop') throw new Error(`Execution brief did not finish normally: ${finish.kind}`)
     const blocks = assembler.blocks()
-    if (blocks.some(block => block.type !== 'text' && block.type !== 'reasoning')) throw new Error('Execution brief returned non-text content')
+    if (contentHasImage(blocks)) throw new LlmError('Execution brief cannot contain image output', 'UNSUPPORTED_CONTENT')
     // Only the text survives into history, so reasoning is neither counted nor retained.
     const rawOutput = blocks.filter(block => block.type === 'text')
     const body = rawOutput.map(block => block.text).join('\n')
@@ -212,7 +211,7 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
     const tokens = this.ctx.tokenMeter.estimateMessage(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
     if (tokens > budget.briefMaxTokens) throw new Error('Execution brief including archive guidance exceeds briefMaxTokens')
     await this.archives.saveBrief(cut, text)
-    return { summary: [{ type: 'text' as const, text }], rawOutput, llmStreamCall: true as const, provider: target.provider, model: target.model, ...(assembler.usage === undefined ? {} : { usage: assembler.usage }) }
+    return { summary: [{ type: 'text' as const, text }], rawOutput, llmStreamCall: true as const, provider: target.provider, model: target.model, maxTokens: 65536, ...(assembler.usage === undefined ? {} : { usage: assembler.usage }) }
   }
 }
 
