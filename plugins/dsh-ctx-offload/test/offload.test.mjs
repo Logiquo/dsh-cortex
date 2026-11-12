@@ -145,11 +145,25 @@ test('corrupt history prevents replacement and leaves the surface intact', async
   assert.equal(session.surface.replaceGeneration, generation)
 })
 
-test('empty output fails without losing context', async t => {
+test('empty output fails on the first attempt without losing context', async t => {
   const { ctx, agent, session, calls } = await fixture(t, {}, { text: '  \n  ' })
   conversation(session, 1)
   await assert.rejects(ctx.compaction.compactNow(agent, new AbortController().signal), error => /brief is empty/.test(error.cause?.message ?? error.message))
+  // A content verdict cannot be re-asked: retrying would buy the same reply twice.
+  assert.equal(calls.length, 1)
+  assert.equal(session.surface.replaceGeneration, 0)
+})
+
+test('a summary-error listener drives the only retry path, as in the host summarizer', async t => {
+  // The plugin never retries by itself. Recovery belongs to the host's
+  // `compaction/summary-error` waterfall, so an after-the-fact verdict runs once.
+  const { ctx, agent, session, calls } = await fixture(t, {}, { text: '  \n  ' })
+  conversation(session, 1)
+  let recoveries = 0
+  ctx.on('compaction/summary-error', () => ++recoveries === 1)
+  await assert.rejects(ctx.compaction.compactNow(agent, new AbortController().signal), error => /brief is empty/.test(error.cause?.message ?? error.message))
   assert.equal(calls.length, 2)
+  assert.equal(recoveries, 2)
   assert.equal(session.surface.replaceGeneration, 0)
 })
 
@@ -205,10 +219,12 @@ test('archive refuses diverging history and recovers a dead writer lock', async 
   await assert.rejects(store.ensure(session.id, changed), /differs from archived prefix/)
 })
 
-test('provider truncation and tiny reductions preserve the unmodified surface', async t => {
-  const { ctx, session, agent } = await fixture(t, {}, { finish: 'max-tokens' })
+test('provider truncation fails once and preserves the unmodified surface', async t => {
+  const { ctx, session, agent, calls } = await fixture(t, {}, { finish: 'max-tokens' })
   conversation(session, 1)
-  await assert.rejects(ctx.compaction.compactNow(agent, new AbortController().signal), error => /max-tokens/.test(error.cause?.message ?? error.message))
+  await assert.rejects(ctx.compaction.compactNow(agent, new AbortController().signal), error => /truncated at the token cap/.test(error.cause?.message ?? error.message))
+  // Truncation is terminal: a second identical call cannot produce a complete brief.
+  assert.equal(calls.length, 1)
   assert.equal(session.surface.replaceGeneration, 0)
 })
 

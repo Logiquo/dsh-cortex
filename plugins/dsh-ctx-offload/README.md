@@ -55,8 +55,11 @@ Reasoning blocks are neither counted nor retained. Automatic and overflow select
 the longest balanced recent suffix that fits, possibly none; larger complete
 messages/tool pairs enter the compacted region. Manual compaction uses the host's
 range selection and rejects a retained last message that exceeds the recent-history
-limit. Malformed briefs are retried once. dsh's native shrinkage check requires the
-framed replacement to be smaller than its source region.
+limit. A brief is attempted once: dsh's native shrinkage check requires the
+framed replacement to be smaller than its source region, and recovery from a
+failed brief belongs to the host's `compaction/summary-error` waterfall, which
+re-runs the brief only after a listener changes the input. A truncated or
+unusable reply is terminal and is not re-asked.
 
 Provider request validation and actual model capacity remain governed by dsh; this
 setting controls the plugin's compaction policy.
