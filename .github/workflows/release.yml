@@ -1,0 +1,118 @@
+name: Release plugins
+
+# Publish every plugin as a tarball when a version tag is pushed. The tag
+# (v0.1.0 or 0.1.0) must match every plugins/*/package.json version.
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify, test, build, and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Every plugin is released together, so the tag must match every
+      # plugins/*/package.json version exactly.
+      - name: Verify plugin versions match the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#[vV]}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '$TAG' must look like v<semver>, for example v0.1.0."
+            exit 1
+          fi
+
+          shopt -s nullglob
+          manifests=(plugins/*/package.json)
+          if (( ${#manifests[@]} == 0 )); then
+            echo "::error::No plugins found under plugins/."
+            exit 1
+          fi
+
+          failed=0
+          for manifest in "${manifests[@]}"; do
+            name=$(node -p "require('./${manifest}').name")
+            actual=$(node -p "require('./${manifest}').version")
+            if [[ "$actual" != "$version" ]]; then
+              echo "::error file=${manifest}::${name} is at ${actual:-<missing>}, but tag ${TAG} requires ${version}."
+              failed=1
+            else
+              echo "${name}@${actual} matches ${TAG}."
+            fi
+          done
+
+          if (( failed )); then
+            echo "::error::Bump every plugin to ${version} before tagging ${TAG}."
+            exit 1
+          fi
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build plugins
+        run: npm run build
+
+      # npm pack runs each plugin's prepack/build and emits the same tarball
+      # that `npm install <file>.tgz` or a registry publish would use.
+      - name: Pack plugin tarballs
+        run: |
+          set -euo pipefail
+
+          rm -rf release
+          mkdir -p release
+
+          shopt -s nullglob
+          for manifest in plugins/*/package.json; do
+            name=$(node -p "require('./${manifest}').name")
+            npm pack --workspace "$name" --pack-destination release
+          done
+
+          if ! compgen -G "release/*.tgz" > /dev/null; then
+            echo "::error::No plugin tarballs were produced."
+            exit 1
+          fi
+
+          ls -l release
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # A re-run of the same tag refreshes the assets instead of failing.
+            gh release upload "$TAG" release/*.tgz --clobber
+          else
+            gh release create "$TAG" release/*.tgz \
+              --verify-tag \
+              --generate-notes \
+              --title "$TAG"
+          fi
