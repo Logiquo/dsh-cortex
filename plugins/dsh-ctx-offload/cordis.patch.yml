@@ -1,0 +1,7 @@
+# Replace the standard dsh-base backend; the host /compact command uses the new service.
+- id: compaction-basic
+  disabled: true
+
+- insert:
+    - id: dsh-ctx-offload
+      name: dsh-ctx-offload

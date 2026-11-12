@@ -61,7 +61,11 @@ include JavaScript, declarations, the bundle patch, README, and license.
 This template targets local links and built tarballs or registry packages.
 Git installs of individual monorepo subdirectories are not supported.
 
-## Planned plugins
+## Plugins
+
+- [`dsh-ctx-offload`](plugins/dsh-ctx-offload/README.md): configurable early compaction,
+  forward-looking execution briefs, and session-scoped history for on-demand
+  delegated grep retrieval. See the [design](DESIGN.md).
 
 - [`dsh-ephemeral-reasoning`](plugins/dsh-ephemeral-reasoning/README.md):
   version-pinned append-time sanitation and meter correction, with real-provider tests.
