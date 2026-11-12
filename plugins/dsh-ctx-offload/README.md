@@ -103,7 +103,7 @@ npm test
 ```
 
 - Real-model brief quality and voluntary retrieval behavior require provider evaluation.
-  Structural validation checks section labels and size, not semantic completeness.
+  Validation checks nonempty text and size; semantic completeness requires model evaluation.
 - Windows/macOS paths use portable APIs; execution and crash durability were exercised
   on Linux. Windows directory fsync is unavailable through the portable Node API.
 - Archives remain across disposal and resume. The inspected host exposes no public

@@ -12,9 +12,8 @@ import { LlmRuntime, LlmAdapter, createUserMessage, createAssistantMessage, crea
 import * as plugin from '../lib/index.js'
 import { Config, archiveRoot } from '../lib/config.js'
 import { ArchiveStore } from '../lib/archive.js'
-import { SECTIONS } from '../lib/brief.js'
 import { budgets, selectRange } from '../lib/policy.js'
-const brief = SECTIONS.map(s => `${s}: ${s === 'Task' ? 'Implement the feature; preserve violet-42.' : 'None'}`).join('\n')
+const brief = 'Implement the feature while preserving violet-42. The next action is to inspect the implementation and run the relevant checks. Completion requires those checks to pass.'
 const user = text => createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
 class Query extends SessionQueryEngine {
   async searchSessions() { throw Error('No search index needed') }
@@ -73,18 +72,18 @@ test('portable defaults and configured context-budget formulas', () => {
   assert.deepEqual(budgets(config), { triggerTokens: 75000, briefMaxTokens: 7500, retainRecentTokens: 15000 })
 })
 
-test('manual compaction commits a forward brief and searchable original history', async t => {
+test('a prose brief without prescribed headings commits with searchable original history', async t => {
   const { ctx, agent, session, calls } = await fixture(t)
   conversation(session, 1, 'Original exact fact: violet-42.\n' + 'History data\n'.repeat(7000))
   const result = await ctx.compaction.compactNow(agent, new AbortController().signal)
   assert.ok(result)
   const summary = result.summary[0].text
-  assert.match(summary, /Next actions:/)
-  assert.match(summary, /spawn a fresh search agent/)
+  assert.match(summary, /Completion requires those checks to pass/)
+  assert.match(summary, /spawn a fresh search agent/i)
   assert.match(summary, /rg\/grep/)
   const catalog = await ctx.compaction.archives.verify(session.id)
   assert.ok(catalog.through >= Number(result.endSeq))
-  const directory = summary.match(/History archive \(plain text\): (.+)/)[1]
+  const directory = summary.match(/History archive: (.+)/)[1]
   const archiveDir = JSON.parse(directory)
   const history = (await Promise.all(catalog.chunks.map(chunk => readFile(join(archiveDir, chunk.file), 'utf8')))).join('\n')
   assert.match(history, /Original exact fact: violet-42/)
@@ -125,10 +124,10 @@ test('corrupt history prevents replacement and leaves the surface intact', async
   assert.equal(session.surface.replaceGeneration, generation)
 })
 
-test('empty brief sections fail without losing context', async t => {
-  const { ctx, agent, session, calls } = await fixture(t, {}, { text: SECTIONS.map(section => `${section}:`).join('\n') })
+test('empty output fails without losing context', async t => {
+  const { ctx, agent, session, calls } = await fixture(t, {}, { text: '  \n  ' })
   conversation(session, 1)
-  await assert.rejects(ctx.compaction.compactNow(agent, new AbortController().signal), error => /brief missing content/.test(error.cause?.message ?? error.message))
+  await assert.rejects(ctx.compaction.compactNow(agent, new AbortController().signal), error => /brief is empty/.test(error.cause?.message ?? error.message))
   assert.equal(calls.length, 2)
   assert.equal(session.surface.replaceGeneration, 0)
 })

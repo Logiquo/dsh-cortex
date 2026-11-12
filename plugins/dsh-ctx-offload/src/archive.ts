@@ -31,13 +31,13 @@ async function publish(path: string, text: string): Promise<void> {
   await writeFileAtomic(path, text, { mode: 0o600, dirMode: 0o700 })
   await syncFile(path)
 }
-export function renderEvents(sessionId: string, events: readonly SessionEvent[]): string {
+export function renderEvents(events: readonly SessionEvent[]): string {
   const sections = events.map(event => {
     // Prefix every body line so user text cannot forge a record boundary.
     const text = extractSessionEventText(event).split('\n').map(line => `| ${line}`).join('\n')
     return `=== event ${event.seq}: ${event.type} ===\n${text}\nCanonical JSON:\n${JSON.stringify(event, null, 2)}\n`
   })
-  return `dsh-ctx-offload text-v1\nSession: ${JSON.stringify(sessionId)}\nCoverage: accepted durable events; attachments represented by references; reasoning follows host sanitation.\n\n${sections.join('\n')}`
+  return sections.join('\n')
 }
 
 /** Dedicated archive ownership; never registers or changes ctx.spillStore. */
@@ -102,7 +102,7 @@ export class ArchiveStore {
           const from = catalog.through + 1
           const through = events.length - 1
           const name = `ctx-offload-c${pad(compaction)}-${turn === null ? 'idle' : `turn${pad(turn)}`}-events${pad(from)}-${pad(through)}.txt`
-          const text = renderEvents(sessionId, pending)
+          const text = renderEvents(pending)
           const saved = await saveTextFile({ root: this.root, sessionId, suggestedName: `${name}.pending`, content: text })
           await syncFile(saved.path)
           signal?.throwIfAborted()

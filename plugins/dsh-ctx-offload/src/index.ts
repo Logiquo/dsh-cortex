@@ -185,7 +185,7 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
       const assembler = new BlockAssembler()
       for await (const chunk of this.ctx.llm.stream({
         provider: target.provider, model: target.model,
-        messages: [...input.messages, { role: 'user', content: [{ type: 'text', text: briefInstruction(bodyBudget) + (attempt ? '\nPrevious output was invalid. Ensure all required labels have content.' : '') }] }],
+        messages: [...input.messages, { role: 'user', content: [{ type: 'text', text: briefInstruction(bodyBudget) + (attempt ? '\nPrevious output could not be used. Return a nonempty execution brief within the token budget; exact headings are optional.' : '') }] }],
         ...(input.tools === undefined ? {} : { tools: [...input.tools] }),
         toolHistory: agent.session.toolHistory(),
         maxTokens: budget.briefMaxTokens,
