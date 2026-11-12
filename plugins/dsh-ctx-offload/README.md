@@ -40,13 +40,18 @@ The internal budget formulas are:
 
 ```text
 triggerTokens      = floor(context-limit * 0.75)
-briefMaxTokens     = max(floor(triggerTokens * 0.10), 2048)
-retainRecentTokens = max(floor(triggerTokens * 0.20), 4096)
+briefMaxTokens     = min(max(floor(triggerTokens * 0.05), 1024), triggerTokens)
+retainRecentTokens = min(max(floor(triggerTokens * 0.10), 4096), triggerTokens)
 ```
 
-The default produces a 75,000-token trigger, a 7,500-token brief limit, and a
-15,000-token recent-history limit. Both content budgets are upper limits, not fill
-targets. The brief includes archive guidance. Automatic and overflow selection retain
+The default produces a 75,000-token trigger, a 3,750-token brief limit, and a
+7,500-token recent-history limit. Both content budgets are upper limits, not fill
+targets; the clamp keeps a small `context-limit` from reserving more than the trigger
+it is carved from. The brief includes archive guidance, which is subtracted from the
+brief limit before generation. `briefMaxTokens` bounds only the text that replaces
+history; the generation call takes the route's own response ceiling, so the model's
+configured reasoning effort does not consume the brief budget or truncate the reply.
+Reasoning blocks are neither counted nor retained. Automatic and overflow selection retain
 the longest balanced recent suffix that fits, possibly none; larger complete
 messages/tool pairs enter the compacted region. Manual compaction uses the host's
 range selection and rejects a retained last message that exceeds the recent-history

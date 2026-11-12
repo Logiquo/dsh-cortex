@@ -25,9 +25,12 @@ export function budgets(config: Config) {
   const contextWindow = config['context-limit']
   if (!Number.isSafeInteger(contextWindow) || contextWindow <= 0) throw new Error('context-limit must be a positive integer')
   const triggerTokens = Math.floor(contextWindow * 0.75)
+  // Floors are absolute, so a small context-limit could otherwise reserve more than
+  // the whole trigger; a reservation above the budget it is carved from is unusable.
+  const reserve = (share: number, floor: number) => Math.min(Math.max(Math.floor(triggerTokens * share), floor), Math.max(triggerTokens, 1))
   return {
     triggerTokens,
-    briefMaxTokens: Math.max(Math.floor(triggerTokens * 0.10), 2048),
-    retainRecentTokens: Math.max(Math.floor(triggerTokens * 0.20), 4096),
+    briefMaxTokens: reserve(0.05, 1024),
+    retainRecentTokens: reserve(0.10, 4096),
   }
 }

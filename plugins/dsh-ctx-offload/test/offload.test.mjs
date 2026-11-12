@@ -35,7 +35,8 @@ async function fixture(t, config = {}, behavior = {}) {
     async *stream(options) {
       calls.push(options)
       if (behavior.onCall) await behavior.onCall(options)
-      yield { type: 'text-delta', index: 0, text: behavior.text ?? brief }
+      if (behavior.reasoning !== undefined) yield { type: 'reasoning-delta', index: 0, text: behavior.reasoning }
+      yield { type: 'text-delta', index: 1, text: behavior.text ?? brief }
       yield { type: 'finish', reason: { kind: behavior.finish ?? 'stop' } }
     }
   }
@@ -65,11 +66,13 @@ async function events(ctx, session) { const cut = await ctx.sessionQuery.observe
 test('portable defaults and configured context-budget formulas', () => {
   const config = Config({})
   assert.equal(archiveRoot(config), join(homedir(), '.dsh', 'ctx-offload'))
-  assert.deepEqual(budgets(Config({ 'context-limit': 32000 })), { triggerTokens: 24000, briefMaxTokens: 2400, retainRecentTokens: 4800 })
-  assert.deepEqual(budgets(Config({ 'context-limit': 16000 })), { triggerTokens: 12000, briefMaxTokens: 2048, retainRecentTokens: 4096 })
+  assert.deepEqual(budgets(Config({ 'context-limit': 32000 })), { triggerTokens: 24000, briefMaxTokens: 1200, retainRecentTokens: 4096 })
+  assert.deepEqual(budgets(Config({ 'context-limit': 16000 })), { triggerTokens: 12000, briefMaxTokens: 1024, retainRecentTokens: 4096 })
+  // A reservation never exceeds the trigger, so a tiny limit cannot request more than it holds.
+  assert.deepEqual(budgets(Config({ 'context-limit': 1000 })), { triggerTokens: 750, briefMaxTokens: 750, retainRecentTokens: 750 })
   assert.throws(() => archiveRoot(Config({ 'spill-root': 'relative' })), /absolute/)
   assert.equal(config['context-limit'], 100000)
-  assert.deepEqual(budgets(config), { triggerTokens: 75000, briefMaxTokens: 7500, retainRecentTokens: 15000 })
+  assert.deepEqual(budgets(config), { triggerTokens: 75000, briefMaxTokens: 3750, retainRecentTokens: 7500 })
 })
 
 test('a prose brief without prescribed headings commits with searchable original history', async t => {
@@ -89,11 +92,29 @@ test('a prose brief without prescribed headings commits with searchable original
   assert.match(history, /Original exact fact: violet-42/)
   assert.equal(calls.length, 1)
   assert.equal(calls[0].purpose, 'compaction')
-  assert.equal(calls[0].maxTokens, 2400)
+  // The route's response ceiling bounds the call, not the text budget it replaces.
+  assert.equal(calls[0].maxTokens, 2048)
   const logged = await events(ctx, session)
   const summaryIndex = logged.findIndex(e => e.type === 'compaction/summary')
   assert.equal(logged[summaryIndex + 1].type, 'user/message')
   assert.ok(session.surface.replaceGeneration > 0)
+})
+
+test('reasoning is neither charged to the brief budget nor retained in history', async t => {
+  // A reasoning block far larger than the brief budget: it must not truncate the call,
+  // must not count against briefMaxTokens, and must not be persisted.
+  const reasoning = 'Deliberation that never enters history. '.repeat(400)
+  const { ctx, agent, session, calls } = await fixture(t, {}, { reasoning })
+  conversation(session, 1, 'Original exact fact: violet-42.\n' + 'History data\n'.repeat(7000))
+  const result = await ctx.compaction.compactNow(agent, new AbortController().signal)
+  assert.ok(result)
+  assert.equal(calls.length, 1)
+  assert.match(result.summary[0].text, /Completion requires those checks to pass/)
+  const logged = await events(ctx, session)
+  const summaryEvent = logged.find(e => e.type === 'compaction/summary')
+  assert.deepEqual(summaryEvent.data.rawOutput.map(block => block.type), ['text'])
+  assert.ok(!JSON.stringify(summaryEvent.data).includes('Deliberation that never enters history'))
+  assert.equal(ctx.tokenMeter.measure(session).nodes.length > 0, true)
 })
 
 test('multiple compactions and reopening the archive preserve canonical early records', async t => {

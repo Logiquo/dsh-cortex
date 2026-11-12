@@ -188,7 +188,10 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
         messages: [...input.messages, { role: 'user', content: [{ type: 'text', text: briefInstruction(bodyBudget) + (attempt ? '\nPrevious output could not be used. Return a nonempty execution brief within the token budget; exact headings are optional.' : '') }] }],
         ...(input.tools === undefined ? {} : { tools: [...input.tools] }),
         toolHistory: agent.session.toolHistory(),
-        maxTokens: budget.briefMaxTokens,
+        // No maxTokens: the call produces reasoning plus the brief, while briefMaxTokens
+        // bounds only the text that replaces history. Capping the call at the text budget
+        // would truncate whenever the route's reasoning effort is high; the response
+        // ceiling belongs to the route.
         sessionId: agent.session.id, purpose: 'compaction',
         ...(signal ? { signal } : {}),
       })) assembler.push(chunk)
@@ -197,15 +200,17 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
       if (finish.kind === 'error' || finish.kind === 'aborted') throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
       try {
         if (finish.kind !== 'stop') throw new Error(`Execution brief did not finish normally: ${finish.kind}`)
-        const rawOutput = assembler.blocks()
-        if (rawOutput.some(block => block.type !== 'text' && block.type !== 'reasoning')) throw new Error('Execution brief returned non-text content')
-        const body = rawOutput.filter(block => block.type === 'text').map(block => block.text).join('\n')
+        const blocks = assembler.blocks()
+        if (blocks.some(block => block.type !== 'text' && block.type !== 'reasoning')) throw new Error('Execution brief returned non-text content')
+        // Only the text survives into history, so reasoning is neither counted nor retained.
+        const rawOutput = blocks.filter(block => block.type === 'text')
+        const body = rawOutput.map(block => block.text).join('\n')
         validateBrief(body)
         const text = frameBrief(body, cut)
         const tokens = this.ctx.tokenMeter.estimateMessage(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
         if (tokens > budget.briefMaxTokens) throw new Error('Execution brief including archive guidance exceeds briefMaxTokens')
         await this.archives.saveBrief(cut, text)
-        return { summary: [{ type: 'text' as const, text }], rawOutput, llmStreamCall: true as const, provider: target.provider, model: target.model, maxTokens: budget.briefMaxTokens, ...(assembler.usage === undefined ? {} : { usage: assembler.usage }) }
+        return { summary: [{ type: 'text' as const, text }], rawOutput, llmStreamCall: true as const, provider: target.provider, model: target.model, ...(assembler.usage === undefined ? {} : { usage: assembler.usage }) }
       } catch (error) { lastError = error }
     }
     throw lastError
