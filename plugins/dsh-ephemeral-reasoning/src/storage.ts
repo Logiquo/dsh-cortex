@@ -53,9 +53,16 @@ function cleanData(type: string, data: unknown): unknown {
   }
 }
 
-/** Sanitize before normal admission, observer publication, and persistence. */
+/**
+ * Sanitize before normal admission, observer publication, and persistence.
+ *
+ * Every session is sanitized, subagents included: reasoning kept in a subagent
+ * log is re-sent on its later steps and across its own turn boundaries, where
+ * the provider no longer restores it, so it is billed on every subsequent round
+ * for the rest of that child's life. The parent never receives child reasoning
+ * in any case, so retaining it buys nothing.
+ */
 export function interceptAppend(session: Session): () => void {
-  if (session.header.origin === 'subagent') return () => {}
   const original = session.append
   let active = true
   // The reflection boundary preserves the generic append method and its overloads.
