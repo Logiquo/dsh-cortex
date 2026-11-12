@@ -2,9 +2,11 @@
 
 Show reasoning while generating, but save only cleared main-agent responses.
 Answers, tool calls/results, IDs, roles, timestamps, and provider billing usage
-are retained. Structured reasoning and opaque replay state are removed from
-both the saved assistant message and its embedded stream, including failed and
-interrupted attempts. Subagents are cleaned too: reasoning kept in a child's
+are retained. Structured reasoning is removed from both the saved assistant
+message and its embedded stream, including failed and interrupted attempts;
+replay state is removed only from settlements that actually carried reasoning,
+since that envelope is index-aligned with the blocks it describes. Subagents are
+cleaned too: reasoning kept in a child's
 log is re-sent on its later steps and across its own turn boundaries, where the
 provider no longer restores it, so it is billed on every subsequent round.
 
@@ -33,6 +35,14 @@ All existing session targets are checked before any patch is installed; newly
 created/resumed sessions are checked before they are patched. Later wrappers
 remain intact when this plugin unloads. Cordis-bound service methods are handled
 through their stored descriptors for reliable cleanup.
+
+Every rejection is decided before the first mutation. A refused version or
+projection check therefore leaves the meter unpatched and the ownership marker
+released, and the plugin can be mounted again after the cause is fixed. The
+occupancy-ring registration wait is bounded; timing out degrades to host ring
+numbers with a warning instead of refusing to start, because the meter is still
+corrected. A session that cannot be wrapped is logged and left on host
+behaviour rather than failing the `agent/created` that produced it.
 
 A projection key cannot be overridden by registering it again — the registry
 only increments the existing reference count and the first definition keeps
@@ -105,17 +115,27 @@ nodes.
 open the provider resends its reasoning, so the billed total stays
 authoritative. A `user/message` closes the turn; from then on the provider stops
 resending that turn's reasoning and the measurement subtracts it. Per settled
-message:
+message the split of the provider's single output count comes from two prices
+taken under the same heuristic:
 
 ```
-reasoning = max(0, outputTokens − price(visible content))
+reasoning = outputTokens × removed / (removed + price(visible content))
 ```
 
-The subtraction uses the provider's own output count and puts the estimator's
-error on the *small* visible part rather than the large reasoning part. When
-sanitation leaves an assistant message empty it derives to nothing, so its
-entire output counts as dropped — the same rule that removes it from the next
-request. Every settled step of the closed turn contributes once.
+`removed` is the price of the reasoning blocks sanitation deleted, recorded on
+the settlement as `ephemeralReasoning.removedTokens`. Because both prices carry
+the same per-character density, that density cancels in the ratio, so the split
+does not depend on the script being space-delimited — pricing the visible text
+alone would read a Chinese or Thai answer as a quarter of its real size and
+report the rest as reasoning that never happened. `usage.reasoningTokens` is
+used directly when an adapter reports it. A settlement written before this
+evidence existed falls back to `max(0, outputTokens − price(visible))`.
+
+When sanitation leaves an assistant message empty there is no visible price, so
+the whole output counts as dropped — the same rule that removes it from the next
+request. Every settled step of the closed turn contributes once, and a loop that
+admits several `user/message` events in a row closes the turn once rather than
+resetting the tally.
 
 ### When the anchor is dropped
 
@@ -127,7 +147,15 @@ back to a current-surface estimate (`tools + surface`):
 - **A replacing surface op** — compaction and prune rewrite the billed history.
   Re-logging an identical envelope (a resumed series) keeps the anchor, since
   the same messages are still billed.
-- **No settled call yet** — a fresh session.
+- **No settled call yet, or no logged `request/header`** — the ring anchors only
+  where the meter anchors, so an unheadered session cannot report two numbers.
+- **An explicit `requestHeader` that differs from the logged one** — the caller
+  is billing a different route or tool set than the anchor recorded.
+
+A replacement ends only the anchor. The open turn's reasoning tally survives,
+because a replaced tool result leaves the rest of the surface in place and the
+provider keeps resending that turn's reasoning; both surfaces therefore subtract
+the same amount when the turn closes.
 
 The fallback exists because the host meter's own anchor survives both cases: it
 compares envelopes by content, so a compaction that re-logs an identical
@@ -150,6 +178,13 @@ unpatched run and the whole history was repriced.
 - **Dropped reasoning assumes the provider discards prior-turn reasoning.**
   That is vendor behaviour, not a dsh API. Where it does not hold the
   measurement over-counts by that turn's reasoning until the next settlement.
+- **The ring's surface fallback is heuristic-priced.** The occupancy projection
+  has no access to the route's image and file pricing, so a session that sends
+  attachments can show a slightly different fallback number than the meter while
+  no anchor is in force.
+- **Settlements written before this version carry no reasoning evidence.** They
+  are measured with the older visible-text subtraction, which over-reports on
+  dense scripts. Nothing migrates them.
 - **A provider that misreports its own usage is trusted.** The anchor is the
   provider's number by design.
 - **No retroactive migration.** Sessions whose reasoning was saved before this
@@ -157,7 +192,10 @@ unpatched run and the whole history was repriced.
 
 The composer occupancy ring and the meter report the same total for every
 session: the corrected occupancy unit is derived by the same rule that measures
-the request, so one session cannot show two different context numbers. That
+the request, including the same anchoring conditions and the same no-anchor
+fallback, so one session cannot show two different context numbers. Each rule is
+pinned by a regression test that drives the real `TokenMeter` and the real
+projection registry together. That
 holds for subagent sessions too, which are sanitized and measured like any
 other session. The context-composition panel is a separate
 breakdown of stored content and does not sum to that total by construction.
@@ -182,6 +220,10 @@ investigation README for installation-path selection and opt-in real-account
 verification. Tests cover save/replay agreement, normal/interrupted/failed
 streams, reconnect and display retirement, billing preservation, metering,
 compaction, native tools, retries, cancellation, lifecycle, and disk resume.
+Regression tests drive the real meter and the real projection registry together
+over the cases that previously diverged: repeated user messages in one loop, a
+prune in the middle of a turn, an unheadered session, a rewritten surface, and a
+refused override.
 The real DeepSeek run also checks increasing cache reuse and clean wire history.
 
 Only structured reasoning and designated replay state are stripped; ordinary

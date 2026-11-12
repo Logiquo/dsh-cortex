@@ -1,9 +1,10 @@
 import type { TokenUsage } from '@deepseek-ai/dsh-llm'
-import { SessionSeq, deriveEventMessage, headerEquals } from '@deepseek-ai/dsh-session'
+import { SessionSeq, canonicalHeader, deriveEventMessage, headerEquals } from '@deepseek-ai/dsh-session'
 import type { EpochHeader, Session } from '@deepseek-ai/dsh-session'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import { estimateMessage, estimateToolsTokens } from '@deepseek-ai/dsh-token-meter/estimate'
 import { patchMethod } from './patch.js'
+import { removedReasoningTokens } from './storage.js'
 
 /**
  * Context pressure as the next request will bill it:
@@ -24,11 +25,10 @@ import { patchMethod } from './patch.js'
  * prices are the ones the route actually declares.
  *
  * **Dropped reasoning — ESTIMATE, zero unless the turn closed.** Reasoning the
- * provider stops resending once a `user/message` arrives. Per settled message it is
- * `outputTokens − heuristic(visible content)`: the exact output count minus a
- * price of the small part that will be resent, so estimator error lands on the
- * visible text rather than on the reasoning. A message sanitation emptied
- * derives to nothing, so its whole output counts as dropped.
+ * provider stops resending once a `user/message` arrives. Per settled message it
+ * is the share of `outputTokens` that the removed reasoning blocks accounted
+ * for. A message sanitation emptied derives to nothing, so its whole output
+ * counts as dropped.
  *
  * While the turn is open the provider resends its reasoning, so nothing is
  * dropped and the billed total alone is authoritative. Every settlement
@@ -45,6 +45,8 @@ interface Anchor {
   /** Sequence of the `assistant/message` that reported this usage. */
   readonly seq: SessionSeq
   readonly usage: Readonly<TokenUsage>
+  /** Envelope the recorded total was billed under. */
+  readonly header: EpochHeader
   /** Whether a `user/message` has been appended after the anchor. */
   readonly closed: boolean
   /** Reasoning of the anchor's turn, still described by `usage` only while the turn is open. */
@@ -83,20 +85,46 @@ function usageTotal(usage: TokenUsage): number {
 }
 
 /**
- * Reasoning a settlement produced, as recorded output minus the heuristic price
- * of what the provider will resend as ordinary content.
+ * Split the provider's exact output count between reasoning and visible text.
  *
- * An assistant message that sanitation emptied derives to no message at all, so
- * its visible price is zero and its whole output is reasoning. That is the same
- * rule that removes it from the next request.
+ * The provider reports one number for both, so the split is inferred from two
+ * prices taken under the same heuristic: the removed reasoning and the visible
+ * content it left behind. Because both prices carry the same per-character
+ * density, that density cancels in the ratio and the split does not depend on
+ * the script being space-delimited. Pricing the visible text alone — the
+ * alternative — reads a Chinese or Thai answer as a quarter of its real size
+ * and reports the rest as reasoning that never happened.
+ * @param outputTokens - the provider's exact output count.
+ * @param removed - heuristic price of the reasoning blocks sanitation removed.
+ * @param visible - heuristic price of what the provider will resend.
+ * @returns non-negative reasoning tokens, at most `outputTokens`.
+ */
+function splitReasoning(outputTokens: number, removed: number, visible: number): number {
+  const total = removed + visible
+  if (outputTokens <= 0 || removed <= 0) return 0
+  if (total <= 0) return outputTokens
+  return Math.min(outputTokens, Math.round(outputTokens * removed / total))
+}
+
+/**
+ * Reasoning a settlement produced.
+ *
+ * The exact count is used when the adapter reports it. Otherwise the split
+ * comes from the evidence sanitation recorded next to the message. A settlement
+ * with no evidence — one written before this plugin sanitized it, or by a run
+ * where it was disabled — falls back to subtracting a price of the visible text,
+ * which is the only fact that remains.
  * @param event - the settled `assistant/message`.
  * @param usage - its provider usage record.
  * @returns non-negative reasoning tokens for that message.
  */
 function reasoningTokens(event: Parameters<typeof deriveEventMessage>[0], usage: TokenUsage): number {
+  if (usage.reasoningTokens !== undefined && usage.reasoningTokens > 0) return usage.reasoningTokens
   const message = deriveEventMessage(event)
   const visible = message === null ? 0 : estimateMessage(message)
-  return Math.max(0, usage.outputTokens - visible)
+  const recorded = removedReasoningTokens(event.data)
+  if (recorded === undefined) return Math.max(0, usage.outputTokens - visible)
+  return splitReasoning(usage.outputTokens, recorded, visible)
 }
 
 /**
@@ -123,10 +151,10 @@ function sameEnvelope(billed: EpochHeader, next: EpochHeader): boolean {
  * replacing surface op means compaction rewrote the billed history. Re-logging
  * an identical envelope does not end it — the same messages are still billed.
  *
- * While the turn is open the provider resends its reasoning, so the billed
- * total stays authoritative. A `user/message` closes the turn: from then on the
- * reasoning counted in `chainReasoning` is no longer resent, and the measurement
- * subtracts it.
+ * Neither event closes the turn. A replaced tool result leaves the rest of the
+ * surface in place, and the provider keeps resending the whole open turn's
+ * reasoning, so `chainReasoning` survives both. Only `usage` stops describing
+ * the history, and only `user/message` stops the resend.
  * @param state - fold state before the unread tail.
  * @param session - session whose durable tail is read.
  * @returns fold state advanced through the current tail.
@@ -204,19 +232,24 @@ function latestAnchor(session: Session): Anchor | undefined {
  * reuse a pre-compaction total against a much smaller surface. Without a usable
  * anchor this therefore prices the current surface instead of passing the host
  * result through.
+ *
+ * An explicit `requestHeader` replaces the logged envelope for the next call,
+ * so the anchor only survives when it bills the same shape. The host makes the
+ * same comparison; skipping it would anchor a total recorded under one route or
+ * tool set onto a request billed under another.
  * @param meter - host token meter instance.
- * @param affected - whether this session's measurements are owned by the plugin.
  * @returns disposer restoring the unpatched method.
  */
-export function interceptMeter(meter: TokenMeter, affected: (session: Session) => boolean): () => void {
+export function interceptMeter(meter: TokenMeter): () => void {
   const measure = meter.measure
   let active = true
   const undo = patchMethod(meter, 'measure', function (this: TokenMeter, session, header) {
     const raw = measure.call(this, session, header)
-    if (!active || !affected(session)) return raw
+    if (!active) return raw
     const anchor = latestAnchor(session)
-    if (anchor === undefined) {
-      const totalTokens = raw.surfaceTokens + estimateToolsTokens(header ?? session.requestHeader())
+    const effective = header === undefined ? session.requestHeader() : canonicalHeader(header)
+    if (anchor === undefined || (effective !== undefined && !sameEnvelope(anchor.header, effective))) {
+      const totalTokens = raw.surfaceTokens + estimateToolsTokens(effective ?? session.requestHeader())
       return Object.freeze({
         ...raw,
         baseline: Object.freeze({ kind: 'estimated' as const, tokens: totalTokens }),
@@ -258,7 +291,7 @@ const PRESSURE_KEY = 'contextPressure'
 /** `stateVersion` the override was validated against. */
 const HOST_PRESSURE_VERSION = 5
 /** The override's own version, so a stale persisted row refolds instead of seeding. */
-const PRESSURE_VERSION = 6
+const PRESSURE_VERSION = 7
 
 /** One pending surface replacement the host priced ahead of its shadow node. */
 interface PressureClaim {
@@ -342,29 +375,66 @@ function parsePressureState(value: unknown): PressureState {
   }
 }
 
-/** Drop the anchor and everything counted against it. */
+/**
+ * Drop the anchor and everything counted against it.
+ *
+ * Neither the envelope nor the turn's own reasoning is dropped. A replaced tool
+ * result leaves the rest of the surface in place: the route and tool set the
+ * envelope describes are unchanged, so the next settlement anchors under the
+ * same one, and the provider keeps resending this turn's reasoning even though
+ * no recorded total describes the new surface any more.
+ * @param state - state carrying an anchor that no longer applies.
+ * @returns state without the billed total, with the envelope and open turn retained.
+ */
 function clearPressureAnchor(state: PressureState): PressureState {
-  const { billedTotal: _billed, envelope: _envelope, ...rest } = state
-  return { ...rest, appendedTokens: 0, turnReasoning: 0, droppedReasoning: 0 }
+  const { billedTotal: _billed, ...rest } = state
+  return { ...rest, appendedTokens: 0 }
 }
 
 /**
- * Install the corrected occupancy unit.
+ * Check that the occupancy unit is the one this override was built for.
+ *
+ * Separate from the install so a version this plugin does not recognize is
+ * refused before any other patch is in place.
  * @param registry - the host `sessionProjections` service.
- * @returns disposer restoring the host definition.
- * @throws when the unit is absent or is not the version this override was built for.
+ * @returns the registration the install will replace.
+ * @throws when the unit is absent or is not the validated version.
  */
-export function interceptPressure(registry: unknown): () => void {
+export function assertPressureCompatible(registry: unknown): void {
+  pressureRegistration(registry)
+}
+
+/**
+ * Resolve and validate the occupancy unit's stored registration.
+ * @param registry - the host `sessionProjections` service.
+ * @returns the live registration.
+ * @throws when the unit is absent or is not the validated version.
+ */
+function pressureRegistration(registry: unknown): { registration: PressureUnit; original: PressureUnit['def'] } {
   const registrations = (registry as { registrations?: Map<string, PressureUnit> }).registrations
   const registration = registrations?.get(PRESSURE_KEY)
   if (registrations === undefined || registration === undefined) {
     throw new Error(`Ephemeral reasoning: the ${PRESSURE_KEY} projection is not registered; refusing to install an unverified override`)
   }
   const original = registration.def
-  const wire = original.wire
-  if (original.stateVersion !== HOST_PRESSURE_VERSION || wire === undefined) {
+  if (original.stateVersion !== HOST_PRESSURE_VERSION || original.wire === undefined) {
     throw new Error(`Ephemeral reasoning: unrecognized ${PRESSURE_KEY} unit (stateVersion ${original.stateVersion}); refusing to patch an unverified implementation (tested dsh 0.2.2-rc.1)`)
   }
+  return { registration, original }
+}
+
+/**
+ * Install the corrected occupancy unit.
+ *
+ * Every rejection is decided before the definition is replaced, so a refused
+ * install leaves the registry and the meter exactly as it found them.
+ * @param registry - the host `sessionProjections` service.
+ * @returns disposer restoring the host definition.
+ * @throws when the unit is absent or is not the version this override was built for.
+ */
+export function interceptPressure(registry: unknown): () => void {
+  const { registration, original } = pressureRegistration(registry)
+  const wire = original.wire!
   const hostApply = original.apply as unknown as (state: PressureState, event: never) => PressureState
   const hostInit = original.init
   const hostView = wire.view
@@ -386,7 +456,9 @@ export function interceptPressure(registry: unknown): () => void {
       }
       case 'user/message': {
         // The turn that just ended is no longer resent; carry its reasoning over.
-        next = { ...next, droppedReasoning: next.turnReasoning, turnReasoning: 0 }
+        // A loop that admits several messages at once closes the turn once and
+        // then repeats this case, so the tally is added to, never replaced.
+        next = { ...next, droppedReasoning: next.droppedReasoning + next.turnReasoning, turnReasoning: 0 }
         break
       }
       case 'assistant/message': {
@@ -396,7 +468,10 @@ export function interceptPressure(registry: unknown): () => void {
           ...next,
           turnReasoning: next.turnReasoning + reasoningTokens(source as never, usage),
           droppedReasoning: 0,
-          billedTotal: usageTotal(usage),
+          // Without a logged envelope there is no billed baseline to anchor to,
+          // and the meter refuses to anchor on one; matching that keeps the two
+          // surfaces from reporting different numbers for the same session.
+          ...next.envelope === undefined ? {} : { billedTotal: usageTotal(usage) },
           appendedTokens: 0,
         }
         break
@@ -422,8 +497,13 @@ export function interceptPressure(registry: unknown): () => void {
       summary: wire.summary,
       view: (state: PressureState): Record<string, unknown> => {
         const host = hostView(state)
-        if (state.billedTotal === undefined) return host
-        return { ...host, projectedTokens: Math.max(0, state.billedTotal + state.appendedTokens - state.droppedReasoning) }
+        if (state.billedTotal !== undefined) {
+          return { ...host, projectedTokens: Math.max(0, state.billedTotal + state.appendedTokens - state.droppedReasoning) }
+        }
+        // No anchor: price the surface the way the meter does. The host's own
+        // figure keeps the pre-replacement sample and drifts high after
+        // compaction, which is the reading this plugin exists to correct.
+        return { ...host, projectedTokens: Math.max(0, state.surfaceTokens + estimateToolsTokens(state.envelope)) }
       },
     },
   }
