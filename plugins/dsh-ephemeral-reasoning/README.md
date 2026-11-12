@@ -5,7 +5,9 @@ Answers, tool calls/results, IDs, roles, timestamps, and provider billing usage
 are retained. Structured reasoning is removed from both the saved assistant
 message and its embedded stream, including failed and interrupted attempts;
 replay state is removed only from settlements that actually carried reasoning,
-since that envelope is index-aligned with the blocks it describes. Subagents are
+and then from both the saved message and the stream's terminal chunk, because
+dsh verifies that a stored settlement still reassembles to its own message,
+usage, and replay state. Subagents are
 cleaned too: reasoning kept in a child's
 log is re-sent on its later steps and across its own turn boundaries, where the
 provider no longer restores it, so it is billed on every subsequent round.
@@ -28,6 +30,9 @@ against those tested implementations, and checks the `contextPressure` unit's
 `stateVersion`, before installing overrides. Unknown builds, mixed versions,
 methods already wrapped by another extension, and an unexpected projection
 version are rejected.
+A payload sanitation cannot read — a missing message, a non-array content, an
+absent payload — is passed through untouched so admission rejects it with the
+host's own error rather than a `TypeError` from inside the sanitizer.
 There is no version-check bypass setting; revalidate and update the compatibility
 guard before supporting another dsh version.
 
@@ -222,8 +227,10 @@ streams, reconnect and display retirement, billing preservation, metering,
 compaction, native tools, retries, cancellation, lifecycle, and disk resume.
 Regression tests drive the real meter and the real projection registry together
 over the cases that previously diverged: repeated user messages in one loop, a
-prune in the middle of a turn, an unheadered session, a rewritten surface, and a
-refused override.
+prune in the middle of a turn, an unheadered session, a rewritten surface, a
+refused override, a settlement that carried no reasoning, a malformed settlement
+that the host must reject in its own words, and a session created while the
+plugin was still waiting for the occupancy unit to register.
 The real DeepSeek run also checks increasing cache reuse and clean wire history.
 
 Only structured reasoning and designated replay state are stripped; ordinary

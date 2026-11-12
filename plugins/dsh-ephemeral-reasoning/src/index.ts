@@ -43,12 +43,16 @@ async function pressureRegistry(ctx: Context): Promise<unknown> {
 
 export async function apply(ctx: Context, config: Config): Promise<void> {
   if (!config.enabled) return
-  const existing = ctx.agents.list()
   assertVersions()
   assertMeterCompatible(ctx.tokenMeter)
+  // The occupancy unit registers during the host's own asynchronous init, so
+  // this wait is the install's only suspension. Every check below runs after it
+  // and nothing awaits again: a list taken before the wait would miss sessions
+  // created while it ran, because the creation listener is registered after it.
+  const registry = await pressureRegistry(ctx)
+  const existing = ctx.agents.list()
   // Validate every existing target before installing any patch.
   for (const agent of existing) assertSessionCompatible(agent.session)
-  const registry = await pressureRegistry(ctx)
   // Everything that can refuse is decided above, before the first mutation.
   if (registry !== undefined) assertPressureCompatible(registry)
   if (Reflect.get(ctx.tokenMeter, owner)) throw new Error('Ephemeral reasoning is already mounted for this token meter')

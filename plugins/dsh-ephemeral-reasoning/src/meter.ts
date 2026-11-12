@@ -337,20 +337,25 @@ interface PressureUnit {
  *
  * Only this plugin's own checkpoints reach it, because the version above
  * rejects older rows; the check exists so a corrupt row refolds instead of
- * poisoning a fold.
+ * poisoning a fold. The rewritten fields are the ones this override adds, so
+ * they are validated strictly; the two host fields it reuses are validated by
+ * dropping them, because the host fold consumes the pending shadow price and
+ * throws on a range it cannot match, and an anchor without the envelope it was
+ * billed under cannot be compared with a future request at all.
  * @param value - persisted state from a checkpoint row.
  * @returns the normalized state.
  */
 function parsePressureState(value: unknown): PressureState {
   if (typeof value !== 'object' || value === null) throw new Error('contextPressure state must be an object')
   const source = value as Record<string, unknown>
+  const isCount = (raw: unknown): raw is number => typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0
   const count = (key: string, required: boolean): number | undefined => {
     const raw = source[key]
     if (raw === undefined) {
       if (required) throw new Error(`contextPressure state is missing "${key}"`)
       return undefined
     }
-    if (typeof raw !== 'number' || !Number.isSafeInteger(raw) || raw < 0) {
+    if (!isCount(raw)) {
       throw new Error(`contextPressure state field "${key}" must be a non-negative safe integer`)
     }
     return raw
@@ -359,16 +364,28 @@ function parsePressureState(value: unknown): PressureState {
   const pressureTokens = count('pressureTokens', false)
   const sampledSurfaceTokens = count('sampledSurfaceTokens', false)
   const billedTotal = count('billedTotal', false)
-  const claim = source['claim']
-  const envelope = source['envelope']
+  const parseClaim = (raw: unknown): PressureClaim | undefined => {
+    if (typeof raw !== 'object' || raw === null) return undefined
+    const fields = raw as Record<string, unknown>
+    const start = fields['start']
+    const end = fields['end']
+    const tokens = fields['tokens']
+    if (!isCount(start) || !isCount(end) || !isCount(tokens)) return undefined
+    return { start: SessionSeq(start), end: SessionSeq(end), tokens }
+  }
+  const claim = parseClaim(source['claim'])
+  const stored = source['envelope']
+  const envelope = typeof stored === 'object' && stored !== null && !Array.isArray(stored)
+    ? stored as EpochHeader
+    : undefined
   return {
     ...contextWindow === undefined ? {} : { contextWindow },
     ...pressureTokens === undefined ? {} : { pressureTokens },
     surfaceTokens: count('surfaceTokens', true)!,
     ...sampledSurfaceTokens === undefined ? {} : { sampledSurfaceTokens },
-    ...claim === undefined ? {} : { claim: claim as PressureClaim },
-    ...envelope === undefined ? {} : { envelope: envelope as EpochHeader },
-    ...billedTotal === undefined ? {} : { billedTotal },
+    ...claim === undefined ? {} : { claim },
+    ...envelope === undefined ? {} : { envelope },
+    ...envelope === undefined || billedTotal === undefined ? {} : { billedTotal },
     appendedTokens: count('appendedTokens', true)!,
     turnReasoning: count('turnReasoning', true)!,
     droppedReasoning: count('droppedReasoning', true)!,

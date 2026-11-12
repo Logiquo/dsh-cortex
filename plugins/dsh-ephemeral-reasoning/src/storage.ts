@@ -58,12 +58,37 @@ function reasoningEvidence(content: SessionEventMap['assistant/message']['messag
 }
 
 /**
+ * Whether a recorded stream carries reasoning that sanitation removes.
+ *
+ * Used to decide the replay envelope, which is index-aligned with the blocks the
+ * stream produced: it may only be dropped from a stream that actually lost
+ * blocks, or the stored stream would no longer describe its own message.
+ * @param stream - recorded stream entries.
+ * @returns true when sanitation would remove at least one record.
+ */
+function streamHadReasoning(stream: readonly AssistantStreamRecord[]): boolean {
+  for (const record of stream) {
+    if (record.type === 'reasoning-chunks') return true
+    if (record.type !== 'chunk') continue
+    const chunk = record.chunk
+    if (chunk.type === 'reasoning-delta') return true
+    if (chunk.type === 'block-start' && chunk.blockType === 'reasoning') return true
+    if (chunk.type === 'block-end' && chunk.block.type === 'reasoning') return true
+  }
+  return false
+}
+
+/**
  * Filter packed records directly: no token-by-token expansion of discarded reasoning.
  * @param stream - recorded stream entries.
+ * @param stripReplayState - drop the terminal replay envelope because the blocks
+ *   it describes went away. It must be decided by the caller that also decides
+ *   the message's own replay state, so the two never disagree: dsh verifies that
+ *   a stored settlement reassembles to its own message, usage and replay state.
  * @returns the entries a model would see, with reasoning removed and the block
  *   indices renumbered to stay dense.
  */
-export function cleanStream(stream: readonly AssistantStreamRecord[]): AssistantStreamRecord[] {
+export function cleanStream(stream: readonly AssistantStreamRecord[], stripReplayState = false): AssistantStreamRecord[] {
   const result: AssistantStreamRecord[] = []
   const indices = new Map<number, number | null>()
   let nextIndex = 0
@@ -89,7 +114,7 @@ export function cleanStream(stream: readonly AssistantStreamRecord[]): Assistant
       if (index === null) continue
       chunk = { ...chunk, index }
     }
-    if (chunk.type === 'finish') {
+    if (chunk.type === 'finish' && stripReplayState) {
       const { replayState: _state, ...finish } = chunk
       chunk = finish
     }
@@ -103,34 +128,49 @@ export function cleanStream(stream: readonly AssistantStreamRecord[]): Assistant
  *
  * A settlement that removed reasoning also drops its provider replay state: that
  * envelope is index-aligned with the blocks it described, so keeping it after
- * the reasoning blocks are gone would answer the wrong block count. A
- * settlement that removed nothing keeps its replay state untouched — the
- * sanitizer rewrites what it must and leaves every other field exactly as the
- * producer wrote it.
+ * the reasoning blocks are gone would answer the wrong block count. The same
+ * decision governs the stream's terminal `finish` record, because dsh verifies
+ * that a stored settlement still reassembles to its own message, usage and
+ * replay state; dropping it from only one of the two makes that check fail on
+ * every settlement that carried no reasoning at all. A settlement that removed
+ * nothing keeps its replay state untouched in both places — the sanitizer
+ * rewrites what it must and leaves every other field exactly as the producer
+ * wrote it.
  * @param type - event type.
  * @param data - event payload as the producer wrote it.
- * @returns the payload to admit.
+ * @returns the payload to admit, untouched when it is not a settlement this
+ *   sanitizer can read. Admission validates every payload; a sanitizer that
+ *   threw its own `TypeError` on a malformed one would replace the host's
+ *   precise rejection with a stack trace that says nothing about the caller's
+ *   mistake.
  */
 function cleanData(type: string, data: unknown): unknown {
   if (type === 'assistant/attempt') {
+    if (typeof data !== 'object' || data === null) return data
     const attempt = data as SessionEventMap['assistant/attempt']
     if (!Array.isArray(attempt.stream)) return data
-    return { ...attempt, stream: cleanStream(attempt.stream) }
+    // A settlement that committed no surface message has no stored message to
+    // agree with, so only a stream that lost blocks gives up its envelope.
+    return { ...attempt, stream: cleanStream(attempt.stream, streamHadReasoning(attempt.stream)) }
   }
   if (type !== 'assistant/message') return data
+  if (typeof data !== 'object' || data === null) return data
   const response = data as SessionEventMap['assistant/message']
-  const content = response.message.content.filter(block => block.type !== 'reasoning')
-  const evidence = reasoningEvidence(response.message.content)
+  const message = response.message
+  if (typeof message !== 'object' || message === null || !Array.isArray(message.content)) return data
+  const content = message.content.filter(block => block.type !== 'reasoning')
+  const evidence = reasoningEvidence(message.content)
+  const stripReplayState = evidence.removedTokens > 0
   // A settlement whose `stream` is absent is admitted unchanged; older writers
   // and third-party loops omit it, and a sanitizer must never be the reason a
   // write fails.
-  const stream = Array.isArray(response.stream) ? { stream: cleanStream(response.stream) } : {}
+  const stream = Array.isArray(response.stream) ? { stream: cleanStream(response.stream, stripReplayState) } : {}
   const repaired = { ...response, ...stream, [REASONING_EVIDENCE]: evidence }
-  if (evidence.removedTokens === 0) return repaired
-  const { replayState: _state, ...source } = response.message.source
+  if (!stripReplayState) return repaired
+  const { replayState: _state, ...source } = message.source
   return {
     ...repaired,
-    message: freezeMessage({ ...response.message, source, content }),
+    message: freezeMessage({ ...message, source, content }),
   }
 }
 

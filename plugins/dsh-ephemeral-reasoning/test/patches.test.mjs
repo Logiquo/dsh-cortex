@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { AssistantStreamAccumulator, BlockAssembler, createAssistantMessage, createUserMessage, expandAssistantStream } from '@deepseek-ai/dsh-llm'
 import { estimateMessage } from '@deepseek-ai/dsh-token-meter/estimate'
 import { interceptAppend, removedReasoningTokens } from '../lib/storage.js'
 import { interceptMeter } from '../lib/meter.js'
@@ -173,7 +173,7 @@ async function setup(existing=[]){
  const ctx=new Context();const agents=existing.map(s=>({id:s.id,session:s,ctx}));
  const projections=ctx.plugin(SessionProjectionRegistry);await projections.await();
  const meterFiber=ctx.plugin(TokenMeter);await meterFiber.await();const meter=ctx.tokenMeter
- ctx.provide('agents',{list:()=>agents});const fiber=ctx.plugin(plugin,{});await fiber.await();return {ctx,fiber,meter}
+ ctx.provide('agents',{list:()=>[...agents]});const fiber=ctx.plugin(plugin,{});await fiber.await();return {ctx,fiber,meter}
 }
 test('existing agents attach for new writes; new/resumed agents attach; dispose restores append',async()=>{
  const s=make();response(s);const base=s.append;const {ctx,fiber}=await setup([s]);response(s)
@@ -379,4 +379,95 @@ test('a refused occupancy override leaves no meter patch and no owner marker beh
  const retry=ctx.plugin(plugin,{})
  await assert.doesNotReject(retry.await(),undefined,'the plugin must be mountable again after a refusal')
  await retry.dispose();await meterFiber.dispose();await projections.dispose()
+})
+test('a settlement that carried no reasoning still reassembles to its own message',()=>{
+ // dsh's persistence verifies every stored settlement against its embedded
+ // stream: content, usage, and replay state must all agree. Dropping the replay
+ // envelope from only one of the two breaks a log written with no reasoning.
+ const replayState={response:{kind:'deepseek-messages',version:1,model:'test'},blocks:[{type:'text'}]}
+ const chunks=[
+  {type:'block-start',index:0,blockType:'text'},
+  {type:'text-delta',index:0,text:'answer'},
+  {type:'block-end',index:0,block:{type:'text',text:'answer'}},
+  {type:'usage',usage:{inputTokens:10,outputTokens:5}},
+  {type:'finish',reason:{kind:'stop'},replayState},
+ ]
+ const accumulator=new AssistantStreamAccumulator()
+ const live=new BlockAssembler()
+ for(const chunk of chunks){const timed=accumulator.push({time:1,chunk});live.push(timed.chunk)}
+ const s=make();const undo=interceptAppend(s)
+ const event=s.append('assistant/message',{turn:1,step:1,stream:accumulator.snapshot(),usage:live.usage,message:createAssistantMessage({content:live.blocks(),source:{provider:'deepseek-account',model:'test',replayState}})},{surfaceOp:'append'})
+ const restored=new BlockAssembler()
+ for(const member of expandAssistantStream(event.data.stream)) restored.push(member.chunk)
+ assert.deepEqual(restored.blocks(),event.data.message.content,'content must reassemble')
+ assert.deepEqual(restored.usage,event.data.usage,'usage must reassemble')
+ assert.deepEqual(restored.replayState,event.data.message.source.replayState,'replay state must reassemble; the two must never disagree')
+ assert.deepEqual(restored.replayState,replayState,'a settlement with no reasoning keeps the envelope it was written with')
+ undo()
+})
+test('a session created while the occupancy unit is registering is still sanitized',async()=>{
+ const host=new Context()
+ const hostProjections=host.plugin(SessionProjectionRegistry);await hostProjections.await()
+ const hostMeter=host.plugin(TokenMeter);await hostMeter.await()
+ const ctx=new Context();const agents=[]
+ // The real registry answers with a fresh array, so a list taken before the
+ // wait cannot see an agent created during it.
+ ctx.provide('agents',{list:()=>[...agents]})
+ ctx.provide('tokenMeter',host.tokenMeter)
+ // A registry whose unit appears only after the mount has begun, the way the
+ // host's own asynchronous init registers it.
+ const registrations=new Map()
+ ctx.provide('sessionProjections',{registrations})
+ const fiber=ctx.plugin(plugin,{})
+ await new Promise(resolve=>setTimeout(resolve,40))
+ const late=make()
+ agents.push({id:late.id,session:late,ctx})
+ registrations.set('contextPressure',{
+  def:{key:'contextPressure',stateVersion:5,stateSchema:{parse:value=>value},init:()=>({surfaceTokens:0}),apply:state=>state,wire:{viewSchema:{parse:value=>value},view:()=>({}),summary:false}},
+  cells:new WeakMap(),refs:1,
+ })
+ await fiber.await()
+ response(late)
+ assert.equal(late.deriveMessages().at(-1).content.length,1,'a session created while the mount waited must be sanitized')
+ await fiber.dispose();await hostMeter.dispose();await hostProjections.dispose()
+})
+test('a corrupt occupancy row cannot poison the fold',async()=>{
+ const {ctx,fiber}=await setup([])
+ const parse=ctx.sessionProjections.registrations.get('contextPressure').def.stateSchema.parse
+ const base={surfaceTokens:10,appendedTokens:4,turnReasoning:8,droppedReasoning:2}
+ assert.deepEqual(parse(base),base,'a row this plugin wrote round-trips')
+ assert.equal(parse({...base,claim:'nope'}).claim,undefined,'a malformed pending claim is dropped, not handed to the host fold')
+ assert.equal(parse({...base,claim:{start:1,end:2,tokens:'x'}}).claim,undefined,'a partially numeric claim is dropped')
+ assert.equal(parse({...base,envelope:'nope',billedTotal:100}).billedTotal,undefined,'a billed total without a usable envelope is dropped')
+ assert.equal(parse({...base,envelope:{config:{provider:'p',model:'m'}},billedTotal:100}).billedTotal,100,'a usable anchor survives')
+ assert.throws(()=>parse({surfaceTokens:1,appendedTokens:0,turnReasoning:0}),/droppedReasoning/,'a missing required tally still fails loudly')
+ await fiber.dispose()
+})
+test('an attempt gives up its replay envelope only when sanitation removed blocks',()=>{
+ const s=make();const undo=interceptAppend(s)
+ const pack=(chunks)=>{const accumulator=new AssistantStreamAccumulator();for(const chunk of chunks)accumulator.push({time:1,chunk});return accumulator.snapshot()}
+ const replayState={response:{kind:'deepseek-messages',version:1,model:'test'},blocks:[{type:'text'}]}
+ const finish={type:'finish',reason:{kind:'stop'},replayState}
+ const plain=s.append('assistant/attempt',{turn:1,step:1,stream:pack([{type:'block-start',index:0,blockType:'text'},{type:'text-delta',index:0,text:'partial'},finish])})
+ const envelope=plain.data.stream.find(record=>record.type==='chunk'&&record.chunk.type==='finish')
+ assert.deepEqual(envelope.chunk.replayState,replayState,'an attempt with no reasoning keeps the envelope it was written with')
+ const reasoned=s.append('assistant/attempt',{turn:1,step:1,stream:pack([{type:'block-start',index:0,blockType:'reasoning'},{type:'reasoning-delta',index:0,text:'private'},finish])})
+ const dropped=reasoned.data.stream.find(record=>record.type==='chunk'&&record.chunk.type==='finish')
+ assert.equal(dropped.chunk.replayState,undefined,'an attempt that lost blocks drops the envelope describing them')
+ undo()
+})
+test('a malformed settlement is rejected by the host, not by the sanitizer',()=>{
+ // The host names the caller's mistake; a sanitizer that dereferences the
+ // payload first replaces that with a TypeError that says nothing.
+ const s=make();const undo=interceptAppend(s)
+ assert.throws(()=>s.append('assistant/message'),/non-JSON-serializable/,'no payload')
+ assert.throws(()=>s.append('assistant/attempt'),/non-JSON-serializable/,'an attempt without a payload is the host\'s rejection')
+ const rejections=[
+  [{turn:1,step:1},/surfaceOp marker/,'no message'],
+  [{turn:1,step:1,stream:[],message:{role:'assistant',content:'text',source:{kind:'model',provider:'p',model:'m'}}},/surfaceOp marker/,'non-array content'],
+ ]
+ for(const [payload,pattern,label] of rejections){
+  assert.throws(()=>s.append('assistant/message',payload),error=>error instanceof Error&&!error.message.startsWith('Cannot read')&&pattern.test(error.message),label)
+ }
+ undo()
 })
