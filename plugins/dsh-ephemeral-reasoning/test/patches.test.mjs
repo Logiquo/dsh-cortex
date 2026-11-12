@@ -471,3 +471,49 @@ test('a malformed settlement is rejected by the host, not by the sanitizer',()=>
  }
  undo()
 })
+test('a finished turn stops resending its reasoning, not only the next prompt',async()=>{
+ // Between `turn/end` and the next input the answer is on screen and the
+ // composer ring is being read, so the number must already exclude reasoning
+ // the next request will not bill.
+ const s=make();const {ctx,fiber,meter}=await setup([])
+ envelope(s);prompt(s,'first')
+ s.append('step/start',{turn:1,step:1})
+ settle(s,{inputTokens:1000,outputTokens:100},ANSWER)
+ s.append('step/end',{turn:1,step:1})
+ const ring=()=>ctx.sessionProjections.snapshot(s,['contextPressure']).values.contextPressure.projectedTokens
+ const open=meter.measure(s).totalTokens
+ assert.equal(ring(),open,'the turn is still open before turn/end')
+ s.append('turn/end',{turn:1,reason:{kind:'completed'}})
+ const closed=meter.measure(s).totalTokens
+ assert.equal(open-closed,100-visible(ANSWER),'exactly the closed turn reasoning is dropped at turn/end')
+ assert.equal(ring(),closed,'the ring must drop it at the same moment the meter does')
+ prompt(s,'second')
+ assert.equal(meter.measure(s).totalTokens,closed+estimateMessage(createUserMessage({source:{kind:'user'},content:[{type:'text',text:'second'}]})),'the next prompt adds its own price and the drop is not applied twice')
+ assert.equal(ring(),meter.measure(s).totalTokens,'both surfaces agree after the next prompt lands')
+ await fiber.dispose()
+})
+test('every settled step of a turn closed by turn/end is dropped once',async()=>{
+ const s=make();const {ctx,fiber,meter}=await setup([])
+ envelope(s);prompt(s,'first')
+ s.append('step/start',{turn:1,step:1})
+ settle(s,{inputTokens:1000,outputTokens:100},ANSWER)
+ s.append('step/end',{turn:1,step:1})
+ s.append('step/start',{turn:1,step:2})
+ s.append('assistant/message',{turn:1,step:2,stream:[],usage:{inputTokens:1200,outputTokens:100},message:createAssistantMessage({content:ANSWER,source:{provider:'deepseek-account',model:'test'}})},{surfaceOp:'append'})
+ s.append('step/end',{turn:1,step:2})
+ const open=meter.measure(s).totalTokens
+ s.append('turn/end',{turn:1,reason:{kind:'completed'}})
+ const closed=meter.measure(s).totalTokens
+ assert.equal(open-closed,2*(100-visible(ANSWER)),'both settled steps of the turn are dropped')
+ s.append('turn/start',{turn:2})
+ s.append('step/start',{turn:2,step:1})
+ s.append('assistant/message',{turn:2,step:1,stream:[],usage:{inputTokens:1500,outputTokens:60},message:createAssistantMessage({content:ANSWER,source:{provider:'deepseek-account',model:'test'}})},{surfaceOp:'append'})
+ s.append('step/end',{turn:2,step:1})
+ assert.equal(meter.measure(s).baseline.tokens,1560,'a new settlement anchors on the provider count again, carrying no stale drop')
+ await fiber.dispose()
+})
+test('the occupancy unit carries a version that discards rows from the old fold',async()=>{
+ const {ctx,fiber}=await setup([])
+ assert.equal(ctx.sessionProjections.registrations.get('contextPressure').def.stateVersion,8,'a persisted version-7 row must refold rather than seed the corrected fold')
+ await fiber.dispose()
+})

@@ -154,7 +154,8 @@ function sameEnvelope(billed: EpochHeader, next: EpochHeader): boolean {
  * Neither event closes the turn. A replaced tool result leaves the rest of the
  * surface in place, and the provider keeps resending the whole open turn's
  * reasoning, so `chainReasoning` survives both. Only `usage` stops describing
- * the history, and only `user/message` stops the resend.
+ * the history, and only the end of the turn stops the resend — which is a
+ * `user/message` opening the next one, or the `turn/end` that closes this one.
  * @param state - fold state before the unread tail.
  * @param session - session whose durable tail is read.
  * @returns fold state advanced through the current tail.
@@ -179,6 +180,12 @@ function fold(state: State, session: Session): State {
         break
       }
       case 'user/message':
+      case 'turn/end':
+        // Either ends this turn: a prompt opening the next one, or the turn's
+        // own close. The provider stops resending the reasoning from here, and
+        // the next request is billed without it. Closing on both is what keeps
+        // the idle window — the moment the answer lands and the user is reading
+        // it — from reporting that reasoning as context still in use.
         chainReasoning = 0
         if (settled !== undefined) closed = true
         break
@@ -291,7 +298,7 @@ const PRESSURE_KEY = 'contextPressure'
 /** `stateVersion` the override was validated against. */
 const HOST_PRESSURE_VERSION = 5
 /** The override's own version, so a stale persisted row refolds instead of seeding. */
-const PRESSURE_VERSION = 7
+const PRESSURE_VERSION = 8
 
 /** One pending surface replacement the host priced ahead of its shadow node. */
 interface PressureClaim {
@@ -471,10 +478,13 @@ export function interceptPressure(registry: unknown): () => void {
         next = { ...next, envelope }
         break
       }
-      case 'user/message': {
+      case 'user/message':
+      case 'turn/end': {
         // The turn that just ended is no longer resent; carry its reasoning over.
         // A loop that admits several messages at once closes the turn once and
-        // then repeats this case, so the tally is added to, never replaced.
+        // then repeats this case, so the tally is added to, never replaced. A
+        // turn that closes before its next prompt lands here first, and the
+        // later `user/message` then adds nothing.
         next = { ...next, droppedReasoning: next.droppedReasoning + next.turnReasoning, turnReasoning: 0 }
         break
       }

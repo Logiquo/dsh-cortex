@@ -118,8 +118,12 @@ nodes.
 
 **Dropped reasoning — estimate, zero unless the turn closed.** While a turn is
 open the provider resends its reasoning, so the billed total stays
-authoritative. A `user/message` closes the turn; from then on the provider stops
-resending that turn's reasoning and the measurement subtracts it. Per settled
+authoritative. Either a `user/message` opening the next turn or the `turn/end`
+closing this one ends that: from then on the provider stops resending that
+turn's reasoning and the measurement subtracts it. Closing on both means the
+idle window — the answer on screen, the user reading it — already reports the
+number the next request will bill, instead of one inflated by reasoning that is
+no longer in context. Per settled
 message the split of the provider's single output count comes from two prices
 taken under the same heuristic:
 
@@ -140,7 +144,9 @@ When sanitation leaves an assistant message empty there is no visible price, so
 the whole output counts as dropped — the same rule that removes it from the next
 request. Every settled step of the closed turn contributes once, and a loop that
 admits several `user/message` events in a row closes the turn once rather than
-resetting the tally.
+resetting the tally. A turn that closes before its next prompt lands contributes
+at `turn/end`, and the later `user/message` then adds nothing — the two closers
+share one accumulator, so a turn cannot be dropped twice or not at all.
 
 ### When the anchor is dropped
 
@@ -229,7 +235,8 @@ Regression tests drive the real meter and the real projection registry together
 over the cases that previously diverged: repeated user messages in one loop, a
 prune in the middle of a turn, an unheadered session, a rewritten surface, a
 refused override, a settlement that carried no reasoning, a malformed settlement
-that the host must reject in its own words, and a session created while the
+that the host must reject in its own words, a turn closed by `turn/end` rather
+than by the next prompt, and a session created while the
 plugin was still waiting for the occupancy unit to register.
 The real DeepSeek run also checks increasing cache reuse and clean wire history.
 
