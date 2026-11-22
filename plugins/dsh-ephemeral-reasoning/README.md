@@ -1,24 +1,14 @@
 # dsh-ephemeral-reasoning
 
-Removes structured reasoning from the conversation dsh persists and replays.
-Live reasoning still reaches the client during generation; the stored assistant
-message and its embedded stream keep only visible content. Answers, tool
-calls/results, IDs, timestamps, and provider usage are retained. Interrupted and
-failed attempts are cleaned the same way, and every agent session is cleaned,
-main and subagent alike. Replaying an earlier turn's reasoning can poison the
-next turn's reasoning, and reasoning kept in the log is billed again on later
-steps. A subagent keeps its log across turns, so it pays that repeatedly.
+Retains structured reasoning in persisted dsh session logs while stripping closed-turn reasoning before outbound model dispatch (for both main and subagent sessions).
 
-Removing reasoning changes the context the host counts, so the plugin re-anchors
-context accounting on the provider's billed total and subtracts reasoning that
-is no longer resent. Three private surfaces are patched:
+Replaying an earlier turn's reasoning can poison subsequent turns and repeatedly bills those tokens on every follow-up turn. At the same time, stripping reasoning only on send keeps the persisted session log complete for UI reopen, offline replay, and context-degradation analysis, while preserving within-turn reasoning keeps multi-step tool-call chains coherent until the turn closes (`user/message` or `turn/end`).
 
-- `Session.append` sanitizes each settlement before admission, publication, and
-  persistence.
-- `TokenMeter.measure` corrects the host-side context measurement.
-- the live `contextPressure` projection definition corrects the client-side
-  composer ring and stats, including its `stateVersion`, `apply`, `view`, and
-  memoized cells.
+Keeping reasoning in the log changes what the host meter counts, so the plugin re-anchors context accounting on the provider's billed total and subtracts closed-turn reasoning that is no longer resent. Three private surfaces are patched:
+
+- `LlmRuntime.forAdapter` strips `reasoning` blocks and `replayState` from completed turns right before adapter dispatch.
+- `TokenMeter.measure` corrects the host-side context measurement (including `nodes` and `surfaceTokens`).
+- the live `contextPressure` projection definition corrects the client-side composer ring and stats, including its `stateVersion`, `apply`, `view`, and memoized cells.
 
 ## Install
 

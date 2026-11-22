@@ -2,9 +2,8 @@ import type { TokenUsage } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, canonicalHeader, deriveEventMessage, headerEquals } from '@deepseek-ai/dsh-session'
 import type { EpochHeader, Session } from '@deepseek-ai/dsh-session'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
-import { estimateMessage, estimateToolsTokens } from '@deepseek-ai/dsh-token-meter/estimate'
+import { estimateContent, estimateMessage, estimateToolsTokens } from '@deepseek-ai/dsh-token-meter/estimate'
 import { patchMethod } from './patch.js'
-import { removedReasoningTokens } from './storage.js'
 
 /**
  * Context pressure as the next request will bill it:
@@ -15,27 +14,22 @@ import { removedReasoningTokens } from './storage.js'
  * `inputTokens + cacheReadTokens + cacheWriteTokens + outputTokens` of the
  * usage record the adapter stored on `assistant/message`. It comes from the
  * provider, not from us, so everything the provider accepted up to that call is
- * counted exactly, including reasoning this plugin removed from storage.
+ * counted exactly.
  *
  * **Appended content — ESTIMATE.** Price of the surface nodes added after the
- * anchor: tool results, user text, and any system or developer update. No server has seen
- * these tokens, so they are priced with dsh's fixed heuristic —
+ * anchor: tool results, user text, and any system or developer update. No server
+ * has seen these tokens, so they are priced with dsh's fixed heuristic —
  * `ceil(chars / 4) + 4` per block plus `4` per message, route-priced for images
- * and files. Computed from the host meter's own `nodes`, so image and file
- * prices are the ones the route actually declares.
+ * and files. Reasoning on completed turns is excluded because outbound
+ * stripping omits it before dispatch.
  *
  * **Dropped reasoning — ESTIMATE, zero unless the turn closed.** Reasoning the
- * provider stops resending once a `user/message` arrives. Per settled message it
- * is the share of `outputTokens` that the removed reasoning blocks accounted
- * for. A message sanitation emptied derives to nothing, so its whole output
- * counts as dropped.
+ * provider stops resending once a `user/message` or `turn/end` closes the turn.
+ * Per settled message it is the share of `outputTokens` that its reasoning
+ * blocks accounted for.
  *
- * While the turn is open the provider resends its reasoning, so nothing is
- * dropped and the billed total alone is authoritative. Every settlement
- * refreshes it, so no term accumulates across the session.
- *
- * Billing is untouched: the recorded usage stays in the log and in every
- * projection that reads it, and only the derived pressure total changes.
+ * While the turn is open the provider keeps resending its reasoning, so nothing
+ * is dropped and the billed total alone is authoritative.
  *
  * @module dsh-ephemeral-reasoning/meter
  */
@@ -47,7 +41,7 @@ interface Anchor {
   readonly usage: Readonly<TokenUsage>
   /** Envelope the recorded total was billed under. */
   readonly header: EpochHeader
-  /** Whether a `user/message` has been appended after the anchor. */
+  /** Whether a `user/message` or `turn/end` has been appended after the anchor. */
   readonly closed: boolean
   /** Reasoning of the anchor's turn, still described by `usage` only while the turn is open. */
   readonly turnReasoning: number
@@ -65,11 +59,15 @@ interface State {
   readonly consumed: number
   /** Envelope in force for the current request series, if one has been logged. */
   readonly header: EpochHeader | undefined
-  /** Reasoning generated since the last `user/message`, over settled messages. */
+  /** Reasoning generated since the last `user/message` or `turn/end`, over settled messages. */
   readonly chainReasoning: number
   readonly settled: Settled | undefined
-  /** Whether a `user/message` landed after `settled`. */
+  /** Whether a `user/message` or `turn/end` landed after `settled`. */
   readonly closed: boolean
+  /** Heuristic reasoning prices of `assistant/message` nodes in the currently open turn. */
+  readonly openTurnNodes: ReadonlyMap<SessionSeq, number>
+  /** Heuristic reasoning prices of `assistant/message` nodes in closed turns. */
+  readonly closedReasoningBySeq: ReadonlyMap<SessionSeq, number>
 }
 
 const states = new WeakMap<Session, State>()
@@ -77,8 +75,6 @@ const states = new WeakMap<Session, State>()
 /**
  * Sum disjoint provider buckets exactly as the host meter does, so a recorded
  * prompt plus response is never double-counted through its reasoning output.
- * @param usage - provider usage record for one settled call.
- * @returns the billed total for that call.
  */
 function usageTotal(usage: TokenUsage): number {
   return usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0) + usage.outputTokens
@@ -86,53 +82,41 @@ function usageTotal(usage: TokenUsage): number {
 
 /**
  * Split the provider's exact output count between reasoning and visible text.
- *
- * The provider reports one number for both, so the split is inferred from two
- * prices taken under the same heuristic: the removed reasoning and the visible
- * content it left behind. Because both prices carry the same per-character
- * density, that density cancels in the ratio and the split does not depend on
- * the script being space-delimited. Pricing the visible text alone — the
- * alternative — reads a Chinese or Thai answer as a quarter of its real size
- * and reports the rest as reasoning that never happened.
- * @param outputTokens - the provider's exact output count.
- * @param removed - heuristic price of the reasoning blocks sanitation removed.
- * @param visible - heuristic price of what the provider will resend.
- * @returns non-negative reasoning tokens, at most `outputTokens`.
  */
-function splitReasoning(outputTokens: number, removed: number, visible: number): number {
-  const total = removed + visible
-  if (outputTokens <= 0 || removed <= 0) return 0
+function splitReasoning(outputTokens: number, reasoning: number, visible: number): number {
+  const total = reasoning + visible
+  if (outputTokens <= 0 || reasoning <= 0) return 0
   if (total <= 0) return outputTokens
-  return Math.min(outputTokens, Math.round(outputTokens * removed / total))
+  return Math.min(outputTokens, Math.round(outputTokens * reasoning / total))
 }
 
 /**
- * Reasoning a settlement produced.
- *
- * The exact count is used when the adapter reports it. Otherwise the split
- * comes from the evidence sanitation recorded next to the message. A settlement
- * with no evidence — one written before this plugin sanitized it, or by a run
- * where it was disabled — falls back to subtracting a price of the visible text,
- * which is the only fact that remains.
- * @param event - the settled `assistant/message`.
- * @param usage - its provider usage record.
- * @returns non-negative reasoning tokens for that message.
+ * Heuristic token price of the reasoning blocks on an `assistant/message` event.
+ */
+function heuristicReasoningTokens(event: { readonly data?: unknown }): number {
+  const data = event.data as { readonly message?: { readonly content?: unknown } } | undefined
+  const content = data?.message?.content
+  if (!Array.isArray(content)) return 0
+  const reasoning = content.filter(block => typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'reasoning')
+  return reasoning.length === 0 ? 0 : estimateContent(reasoning as never)
+}
+
+/**
+ * Reasoning a settlement produced, read directly from the stored message content
+ * when the adapter does not report `usage.reasoningTokens`.
  */
 function reasoningTokens(event: Parameters<typeof deriveEventMessage>[0], usage: TokenUsage): number {
   if (usage.reasoningTokens !== undefined && usage.reasoningTokens > 0) return usage.reasoningTokens
   const message = deriveEventMessage(event)
-  const visible = message === null ? 0 : estimateMessage(message)
-  const recorded = removedReasoningTokens(event.data)
-  if (recorded === undefined) return Math.max(0, usage.outputTokens - visible)
-  return splitReasoning(usage.outputTokens, recorded, visible)
+  if (message === null) return usage.outputTokens > 0 ? usage.outputTokens : 0
+  const reasoning = message.content.filter(block => block.type === 'reasoning')
+  const reasoningPrice = reasoning.length === 0 ? 0 : estimateContent(reasoning)
+  const visibleBlocks = message.content.filter(block => block.type !== 'reasoning')
+  const visiblePrice = visibleBlocks.length === 0 ? 0 : estimateMessage({ ...message, content: visibleBlocks })
+  return splitReasoning(usage.outputTokens, reasoningPrice, visiblePrice)
 }
 
-/**
- * Compare two envelopes without letting an uncomparable pair keep an anchor.
- * @param billed - envelope the recorded total was billed under.
- * @param next - envelope now in force.
- * @returns whether both describe the same billable request shape.
- */
+/** Compare two envelopes without letting an uncomparable pair keep an anchor. */
 function sameEnvelope(billed: EpochHeader, next: EpochHeader): boolean {
   try {
     return headerEquals(billed, next)
@@ -142,35 +126,23 @@ function sameEnvelope(billed: EpochHeader, next: EpochHeader): boolean {
 }
 
 /**
- * Replay one session's unread durable tail for its newest usable anchor.
- *
- * A settlement's `usage` is the provider's own count of the prompt it received
- * and the response it produced, so it is exact for everything sent up to that
- * call. Two later events end that guarantee: a request envelope with different
- * content means the next call bills a different route or tool set, and a
- * replacing surface op means compaction rewrote the billed history. Re-logging
- * an identical envelope does not end it — the same messages are still billed.
- *
- * Neither event closes the turn. A replaced tool result leaves the rest of the
- * surface in place, and the provider keeps resending the whole open turn's
- * reasoning, so `chainReasoning` survives both. Only `usage` stops describing
- * the history, and only the end of the turn stops the resend — which is a
- * `user/message` opening the next one, or the `turn/end` that closes this one.
- * @param state - fold state before the unread tail.
- * @param session - session whose durable tail is read.
- * @returns fold state advanced through the current tail.
+ * Replay one session's unread durable tail for its newest usable anchor and
+ * per-node closed-turn reasoning prices.
  */
 function fold(state: State, session: Session): State {
+  if (state.consumed >= session.seq) return state
   let consumed = state.consumed
   let header = state.header
   let chainReasoning = state.chainReasoning
   let settled = state.settled
   let closed = state.closed
+  const openTurnNodes = new Map(state.openTurnNodes)
+  const closedReasoningBySeq = new Map(state.closedReasoningBySeq)
+
   while (consumed < session.seq) {
     const event = session.eventAt(SessionSeq(consumed))
     consumed += 1
     if (event === undefined) continue
-    // A replacing node rewrote the billed history; no earlier total describes it.
     if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') settled = undefined
     switch (event.type) {
       case 'request/header': {
@@ -181,15 +153,14 @@ function fold(state: State, session: Session): State {
       }
       case 'user/message':
       case 'turn/end':
-        // Either ends this turn: a prompt opening the next one, or the turn's
-        // own close. The provider stops resending the reasoning from here, and
-        // the next request is billed without it. Closing on both is what keeps
-        // the idle window — the moment the answer lands and the user is reading
-        // it — from reporting that reasoning as context still in use.
         chainReasoning = 0
         if (settled !== undefined) closed = true
+        for (const [seq, tokens] of openTurnNodes) closedReasoningBySeq.set(seq, tokens)
+        openTurnNodes.clear()
         break
       case 'assistant/message': {
+        const hReasoning = heuristicReasoningTokens(event)
+        if (hReasoning > 0) openTurnNodes.set(event.seq, hReasoning)
         const usage = event.data.usage
         if (usage === undefined) break
         chainReasoning += reasoningTokens(event, usage)
@@ -203,49 +174,34 @@ function fold(state: State, session: Session): State {
         break
     }
   }
-  return { consumed, header, chainReasoning, settled, closed }
+  return { consumed, header, chainReasoning, settled, closed, openTurnNodes, closedReasoningBySeq }
 }
 
 /**
- * Read the session's newest usable anchor without mutating it.
- *
- * Reads only durable events, so a resumed session rebuilds the same anchor from
- * its log. Cost is O(events appended since the previous call).
- * @param session - main-agent session to fold.
- * @returns the newest usable anchor, or undefined before any settled call.
+ * Read the session's newest usable anchor and closed-turn reasoning map.
  */
-function latestAnchor(session: Session): Anchor | undefined {
+function latestState(session: Session): { anchor: Anchor | undefined; closedReasoningBySeq: ReadonlyMap<SessionSeq, number> } {
   const previous = states.get(session) ?? {
     consumed: 0,
     header: undefined,
     chainReasoning: 0,
     settled: undefined,
     closed: false,
+    openTurnNodes: new Map<SessionSeq, number>(),
+    closedReasoningBySeq: new Map<SessionSeq, number>(),
   }
   const next = fold(previous, session)
   states.set(session, next)
-  if (next.settled === undefined) return undefined
-  return { ...next.settled, closed: next.closed }
+  return {
+    anchor: next.settled === undefined ? undefined : { ...next.settled, closed: next.closed },
+    closedReasoningBySeq: next.closedReasoningBySeq,
+  }
 }
 
 /**
- * Report the billed total, plus appended content, minus dropped reasoning.
- *
- * The host meter already accepts a recorded usage anchor, but only when that
- * total reaches its fixed chars-per-token price of the same history; that
- * heuristic runs high on prose, so a real count is routinely rejected and the
- * whole history is repriced instead. Compaction re-logs an identical envelope,
- * which the host guard cannot tell from an unchanged one, so it would also
- * reuse a pre-compaction total against a much smaller surface. Without a usable
- * anchor this therefore prices the current surface instead of passing the host
- * result through.
- *
- * An explicit `requestHeader` replaces the logged envelope for the next call,
- * so the anchor only survives when it bills the same shape. The host makes the
- * same comparison; skipping it would anchor a total recorded under one route or
- * tool set onto a request billed under another.
- * @param meter - host token meter instance.
- * @returns disposer restoring the unpatched method.
+ * Report the billed total, plus appended content (excluding closed-turn reasoning),
+ * minus dropped reasoning, and adjust `nodes` / `surfaceTokens` so persisted
+ * closed-turn reasoning does not inflate downstream compaction budgets.
  */
 export function interceptMeter(meter: TokenMeter): () => void {
   const measure = meter.measure
@@ -253,24 +209,41 @@ export function interceptMeter(meter: TokenMeter): () => void {
   const undo = patchMethod(meter, 'measure', function (this: TokenMeter, session, header) {
     const raw = measure.call(this, session, header)
     if (!active) return raw
-    const anchor = latestAnchor(session)
+    const { anchor, closedReasoningBySeq } = latestState(session)
+    let nodesChanged = false
+    const nodes = raw.nodes.map((node) => {
+      const removed = closedReasoningBySeq.get(node.seq) ?? 0
+      if (removed <= 0) return node
+      nodesChanged = true
+      return Object.freeze({
+        ...node,
+        tokens: Math.max(0, node.tokens - removed),
+        heuristicTokens: Math.max(0, node.heuristicTokens - removed),
+      })
+    })
+    const adjustedNodes = nodesChanged ? Object.freeze(nodes) : raw.nodes
+    const surfaceTokens = nodesChanged ? adjustedNodes.reduce((sum, node) => sum + node.tokens, 0) : raw.surfaceTokens
     const effective = header === undefined ? session.requestHeader() : canonicalHeader(header)
+
     if (anchor === undefined || (effective !== undefined && !sameEnvelope(anchor.header, effective))) {
-      const totalTokens = raw.surfaceTokens + estimateToolsTokens(effective ?? session.requestHeader())
+      const totalTokens = surfaceTokens + estimateToolsTokens(effective ?? session.requestHeader())
       return Object.freeze({
         ...raw,
+        nodes: adjustedNodes,
+        surfaceTokens,
         baseline: Object.freeze({ kind: 'estimated' as const, tokens: totalTokens }),
         surfaceDeltaTokens: 0,
         totalTokens,
       })
     }
-    // Every node at or before the anchor was inside the prompt the provider billed.
     let appended = 0
-    for (const node of raw.nodes) if (node.seq > anchor.seq) appended += node.tokens
+    for (const node of adjustedNodes) if (node.seq > anchor.seq) appended += node.tokens
     const billed = usageTotal(anchor.usage)
     const dropped = anchor.closed ? anchor.turnReasoning : 0
     return Object.freeze({
       ...raw,
+      nodes: adjustedNodes,
+      surfaceTokens,
       baseline: Object.freeze({ kind: 'usage' as const, tokens: billed, usage: anchor.usage }),
       surfaceDeltaTokens: appended - dropped,
       totalTokens: Math.max(0, billed + appended - dropped),
@@ -281,33 +254,18 @@ export function interceptMeter(meter: TokenMeter): () => void {
 
 /* -------------------------------------------------------------------------- *
  * The client-visible occupancy unit
- *
- * `measure()` is host-side. The composer ring and the stats panel read the
- * `contextPressure` projection, which the host computes from prompt-side usage
- * plus surface movement: it never includes reasoning the provider re-sends, so
- * mid-turn it reports less than the next request will bill.
- *
- * The registry cannot be overridden by registering the same key — a second
- * registration only increments the existing reference count and the first
- * definition keeps driving. This replaces the live definition in place and
- * drops its memoized cells so every session refolds with the corrected fold.
  * -------------------------------------------------------------------------- */
 
-/** Key of the host occupancy unit this plugin corrects. */
 const PRESSURE_KEY = 'contextPressure'
-/** `stateVersion` the override was validated against. */
 const HOST_PRESSURE_VERSION = 5
-/** The override's own version, so a stale persisted row refolds instead of seeding. */
-const PRESSURE_VERSION = 8
+const PRESSURE_VERSION = 9
 
-/** One pending surface replacement the host priced ahead of its shadow node. */
 interface PressureClaim {
   readonly start: SessionSeq
   readonly end: SessionSeq
   readonly tokens: number
 }
 
-/** State of the corrected occupancy unit: the host's fields plus the anchor facts. */
 interface PressureState {
   readonly contextWindow?: number
   readonly pressureTokens?: number
@@ -321,9 +279,14 @@ interface PressureState {
   readonly turnReasoning: number
   /** Reasoning of the turn that closed; the provider no longer resends it. */
   readonly droppedReasoning: number
+  /** Heuristic reasoning of the turn now open (included in host surfaceTokens). */
+  readonly openHeuristicReasoning: number
+  /** Unanchored heuristic reasoning added since the latest usage anchor. */
+  readonly unanchoredOpenReasoning: number
+  /** Heuristic reasoning of closed turns still retained in host surfaceTokens. */
+  readonly closedHeuristicReasoning: number
 }
 
-/** The registry's stored definition, as far as this override touches it. */
 interface PressureUnit {
   def: {
     stateVersion: number
@@ -337,27 +300,9 @@ interface PressureUnit {
     }
   }
   cells: WeakMap<object, unknown>
-  /**
-   * Live registrants sharing the unit. A released predecessor stays in the
-   * table with `0`; replacing its definition would be invisible to the live
-   * drive and to a re-registration, which builds a fresh one.
-   */
   refs?: number
 }
 
-/**
- * Validate one persisted occupancy row.
- *
- * Only this plugin's own checkpoints reach it, because the version above
- * rejects older rows; the check exists so a corrupt row refolds instead of
- * poisoning a fold. The rewritten fields are the ones this override adds, so
- * they are validated strictly; the two host fields it reuses are validated by
- * dropping them, because the host fold consumes the pending shadow price and
- * throws on a range it cannot match, and an anchor without the envelope it was
- * billed under cannot be compared with a future request at all.
- * @param value - persisted state from a checkpoint row.
- * @returns the normalized state.
- */
 function parsePressureState(value: unknown): PressureState {
   if (typeof value !== 'object' || value === null) throw new Error('contextPressure state must be an object')
   const source = value as Record<string, unknown>
@@ -402,44 +347,21 @@ function parsePressureState(value: unknown): PressureState {
     appendedTokens: count('appendedTokens', true)!,
     turnReasoning: count('turnReasoning', true)!,
     droppedReasoning: count('droppedReasoning', true)!,
+    openHeuristicReasoning: count('openHeuristicReasoning', true)!,
+    unanchoredOpenReasoning: count('unanchoredOpenReasoning', true)!,
+    closedHeuristicReasoning: count('closedHeuristicReasoning', true)!,
   }
 }
 
-/**
- * Drop the anchor and everything counted against it.
- *
- * Neither the envelope nor the turn's own reasoning is dropped. A replaced tool
- * result leaves the rest of the surface in place: the route and tool set the
- * envelope describes are unchanged, so the next settlement anchors under the
- * same one, and the provider keeps resending this turn's reasoning even though
- * no recorded total describes the new surface any more.
- * @param state - state carrying an anchor that no longer applies.
- * @returns state without the billed total, with the envelope and open turn retained.
- */
 function clearPressureAnchor(state: PressureState): PressureState {
   const { billedTotal: _billed, ...rest } = state
-  return { ...rest, appendedTokens: 0 }
+  return { ...rest, appendedTokens: 0, unanchoredOpenReasoning: 0, closedHeuristicReasoning: 0 }
 }
 
-/**
- * Check that the occupancy unit is the one this override was built for.
- *
- * Separate from the install so a version this plugin does not recognize is
- * refused before any other patch is in place.
- * @param registry - the host `sessionProjections` service.
- * @returns the registration the install will replace.
- * @throws when the unit is absent or is not the validated version.
- */
 export function assertPressureCompatible(registry: unknown): void {
   pressureRegistration(registry)
 }
 
-/**
- * Resolve and validate the occupancy unit's stored registration.
- * @param registry - the host `sessionProjections` service.
- * @returns the live registration.
- * @throws when the unit is absent or is not the validated version.
- */
 function pressureRegistration(registry: unknown): { registration: PressureUnit; original: PressureUnit['def'] } {
   const registrations = (registry as { registrations?: Map<string, PressureUnit> }).registrations
   const registration = registrations?.get(PRESSURE_KEY)
@@ -456,15 +378,6 @@ function pressureRegistration(registry: unknown): { registration: PressureUnit; 
   return { registration, original }
 }
 
-/**
- * Install the corrected occupancy unit.
- *
- * Every rejection is decided before the definition is replaced, so a refused
- * install leaves the registry and the meter exactly as it found them.
- * @param registry - the host `sessionProjections` service.
- * @returns disposer restoring the host definition.
- * @throws when the unit is absent or is not the version this override was built for.
- */
 export function interceptPressure(registry: unknown): () => void {
   const { registration, original } = pressureRegistration(registry)
   const wire = original.wire!
@@ -478,7 +391,6 @@ export function interceptPressure(registry: unknown): () => void {
     const appendedTokens = state.appendedTokens + (base.surfaceTokens - state.surfaceTokens)
     if (appendedTokens !== state.appendedTokens) next = { ...next, appendedTokens }
     const op = 'surfaceOp' in source ? source.surfaceOp : undefined
-    // A replacing node — compaction, prune — rewrote the surface the total described.
     if (op !== undefined && op !== 'append') next = clearPressureAnchor(next)
     switch (source.type) {
       case 'request/header': {
@@ -489,26 +401,36 @@ export function interceptPressure(registry: unknown): () => void {
       }
       case 'user/message':
       case 'turn/end': {
-        // The turn that just ended is no longer resent; carry its reasoning over.
-        // A loop that admits several messages at once closes the turn once and
-        // then repeats this case, so the tally is added to, never replaced. A
-        // turn that closes before its next prompt lands here first, and the
-        // later `user/message` then adds nothing.
-        next = { ...next, droppedReasoning: next.droppedReasoning + next.turnReasoning, turnReasoning: 0 }
+        next = {
+          ...next,
+          droppedReasoning: next.droppedReasoning + next.turnReasoning,
+          turnReasoning: 0,
+          closedHeuristicReasoning: next.closedHeuristicReasoning + next.openHeuristicReasoning,
+          openHeuristicReasoning: 0,
+          appendedTokens: Math.max(0, next.appendedTokens - state.unanchoredOpenReasoning),
+          unanchoredOpenReasoning: 0,
+        }
         break
       }
       case 'assistant/message': {
+        const hReasoning = heuristicReasoningTokens(source)
         const usage = source.data['usage'] as TokenUsage | undefined
-        if (usage === undefined) break
+        if (usage === undefined) {
+          next = {
+            ...next,
+            openHeuristicReasoning: next.openHeuristicReasoning + hReasoning,
+            unanchoredOpenReasoning: next.unanchoredOpenReasoning + hReasoning,
+          }
+          break
+        }
         next = {
           ...next,
           turnReasoning: next.turnReasoning + reasoningTokens(source as never, usage),
           droppedReasoning: 0,
-          // Without a logged envelope there is no billed baseline to anchor to,
-          // and the meter refuses to anchor on one; matching that keeps the two
-          // surfaces from reporting different numbers for the same session.
           ...next.envelope === undefined ? {} : { billedTotal: usageTotal(usage) },
           appendedTokens: 0,
+          openHeuristicReasoning: next.openHeuristicReasoning + hReasoning,
+          unanchoredOpenReasoning: 0,
         }
         break
       }
@@ -526,6 +448,9 @@ export function interceptPressure(registry: unknown): () => void {
       appendedTokens: 0,
       turnReasoning: 0,
       droppedReasoning: 0,
+      openHeuristicReasoning: 0,
+      unanchoredOpenReasoning: 0,
+      closedHeuristicReasoning: 0,
     }),
     apply: apply as never,
     wire: {
@@ -536,10 +461,10 @@ export function interceptPressure(registry: unknown): () => void {
         if (state.billedTotal !== undefined) {
           return { ...host, projectedTokens: Math.max(0, state.billedTotal + state.appendedTokens - state.droppedReasoning) }
         }
-        // No anchor: price the surface the way the meter does. The host's own
-        // figure keeps the pre-replacement sample and drifts high after
-        // compaction, which is the reading this plugin exists to correct.
-        return { ...host, projectedTokens: Math.max(0, state.surfaceTokens + estimateToolsTokens(state.envelope)) }
+        return {
+          ...host,
+          projectedTokens: Math.max(0, state.surfaceTokens - state.closedHeuristicReasoning + estimateToolsTokens(state.envelope)),
+        }
       },
     },
   }
@@ -547,7 +472,6 @@ export function interceptPressure(registry: unknown): () => void {
   registration.def = installed
   registration.cells = new WeakMap()
   return () => {
-    // A definition installed after this one owns the unit now; leave it in place.
     if (registration.def !== installed) return
     registration.def = original
     registration.cells = new WeakMap()
