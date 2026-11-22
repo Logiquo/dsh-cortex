@@ -12,7 +12,7 @@ test('exact package versions are required, including every prerelease component'
  assert.doesNotThrow(()=>assertVersions())
  assert.doesNotThrow(()=>assertVersions(versions))
  for(const name of names){
-  for(const version of ['0.2.2-rc.2','0.2.2','0.2.1-rc.1']) assert.throws(()=>assertVersions({...versions,[name]:version}),new RegExp(name.replaceAll('.','\\.')+'@0\\.2\\.2-rc\\.1'))
+  for(const version of ['0.2.2-rc.4','0.2.2','0.2.1-rc.1']) assert.throws(()=>assertVersions({...versions,[name]:version}),new RegExp(name.replaceAll('.','\\.')+'@0\\.2\\.2-rc\\.5'))
   const missing={...versions};delete missing[name];assert.throws(()=>assertVersions(missing),/found missing/)
  }
 })

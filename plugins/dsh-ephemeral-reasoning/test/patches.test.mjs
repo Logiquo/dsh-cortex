@@ -310,6 +310,27 @@ test('dense scripts are not misread as reasoning, and no reasoning is inferred f
  assert.equal(meter.measure(s).totalTokens,500+cjk.length+estimateMessage(createUserMessage({source:{kind:'user'},content:[{type:'text',text:'next'}]})),'no reasoning is invented, so nothing is subtracted')
  undo();await fiber.dispose()
 })
+test('a batch append is sanitized member by member and keeps the tuple shape',()=>{
+ // rc.5 accepts positional batches: [type, data, opts?]. Reading a member as an
+ // object silently drops both its type and its payload, so the host rejects the
+ // whole batch. Every member must be sanitized in place and committed.
+ const s=make();const undo=interceptAppend(s)
+ const replayState={response:{kind:'deepseek-messages',version:1,model:'test'},blocks:[{type:'reasoning'},{type:'text'}]}
+ const events=s.append([
+  ['assistant/message',{turn:1,step:1,stream:[],usage:{inputTokens:10,outputTokens:5},message:createAssistantMessage({content:[{type:'reasoning',text:'private'},{type:'text',text:'answer'}],source:{provider:'deepseek-account',model:'test',replayState}})},{surfaceOp:'append'}],
+  ['user/message',createUserMessage({source:{kind:'user'},content:[{type:'text',text:'next'}]}),{surfaceOp:'append'}],
+ ])
+ assert.equal(events.length,2)
+ assert.equal(events[0].type,'assistant/message')
+ assert.deepEqual(events[0].data.message.content,[{type:'text',text:'answer'}],'batch reasoning must be removed')
+ assert.equal(events[0].data.message.source.replayState,undefined,'the batch settlement drops the envelope it no longer matches')
+ assert.ok(removedReasoningTokens(events[0].data)>0,'the batch settlement carries its reasoning evidence')
+ assert.equal(events[1].type,'user/message')
+ assert.equal(events[1].seq,1)
+ assert.deepEqual(s.deriveMessages().map(message=>message.role),['assistant','user'])
+ assert.equal(s.deriveMessages()[0].content.length,1)
+ undo()
+})
 test('a settlement without a stream field is admitted unchanged',()=>{
  const s=make();const undo=interceptAppend(s)
  let event
@@ -380,6 +401,49 @@ test('a refused occupancy override leaves no meter patch and no owner marker beh
  await assert.doesNotReject(retry.await(),undefined,'the plugin must be mountable again after a refusal')
  await retry.dispose();await meterFiber.dispose();await projections.dispose()
 })
+test('a released occupancy predecessor is refused instead of patched invisibly',async()=>{
+ const ctx=new Context()
+ const projections=ctx.plugin(SessionProjectionRegistry);await projections.await()
+ const meterFiber=ctx.plugin(TokenMeter);await meterFiber.await()
+ const registration=ctx.sessionProjections.registrations.get('contextPressure')
+ const liveRefs=registration.refs
+ registration.refs=0
+ ctx.provide('agents',{list:()=>[]})
+ const before=Object.getOwnPropertyDescriptor(ctx.tokenMeter,'measure')
+ const fiber=ctx.plugin(plugin,{})
+ await assert.rejects(fiber.await(),/released predecessor/,'a unit the live drive no longer serves must not be replaced')
+ assert.deepEqual(Object.getOwnPropertyDescriptor(ctx.tokenMeter,'measure'),before,'the meter must not stay patched')
+ assert.equal(Reflect.get(ctx.tokenMeter,Symbol.for('dsh-ephemeral-reasoning.owner')),undefined,'the owner marker must be released')
+ registration.refs=liveRefs
+ await meterFiber.dispose();await projections.dispose()
+})
+test('a settlement the sanitizer cannot read is admitted exactly as written',()=>{
+ // The host accepts these payloads, and a sanitizer that dereferences one
+ // replaces that behaviour with a `TypeError` from inside the plugin. A stream
+ // record it cannot rewrite must also leave its message alone, or the two would
+ // stop describing the same blocks.
+ const source={kind:'model',provider:'p',model:'m'}
+ const reasoning=[{type:'reasoning',text:'private'}]
+ const payloads=[
+  ['a null content block',{message:{role:'assistant',content:[null],source}}],
+  ['a scalar content block',{message:{role:'assistant',content:[42],source}}],
+  ['a reasoning block with no source',{message:{role:'assistant',content:reasoning}}],
+  ['a null stream record',{message:{role:'assistant',content:reasoning,source},stream:[null]}],
+  ['a chunk with no chunk payload',{message:{role:'assistant',content:reasoning,source},stream:[{type:'chunk',time:1}]}],
+  ['a packed run with no index',{message:{role:'assistant',content:reasoning,source},stream:[{type:'text-chunks',time0:1,dt:[],texts:['a']}]}],
+  ['a scalar stream record',{message:{role:'assistant',content:reasoning,source},stream:['nope']}],
+ ]
+ for(const [label,extra] of payloads){
+  const s=make();const undo=interceptAppend(s)
+  const payload={turn:1,step:1,stream:[],...extra}
+  let event
+  assert.doesNotThrow(()=>{event=s.append('assistant/message',structuredClone(payload),{surfaceOp:'append'})},label)
+  assert.deepEqual(event.data.message,payload.message,`${label}: the message must be untouched`)
+  assert.deepEqual(event.data.stream,payload.stream,`${label}: the stream must be untouched`)
+  assert.equal(event.data.ephemeralReasoning,undefined,`${label}: no evidence is invented`)
+  undo()
+ }
+})
 test('a settlement that carried no reasoning still reassembles to its own message',()=>{
  // dsh's persistence verifies every stored settlement against its embedded
  // stream: content, usage, and replay state must all agree. Dropping the replay
@@ -403,6 +467,43 @@ test('a settlement that carried no reasoning still reassembles to its own messag
  assert.deepEqual(restored.usage,event.data.usage,'usage must reassemble')
  assert.deepEqual(restored.replayState,event.data.message.source.replayState,'replay state must reassemble; the two must never disagree')
  assert.deepEqual(restored.replayState,replayState,'a settlement with no reasoning keeps the envelope it was written with')
+ undo()
+})
+test('a sanitized multi-block stream reassembles to its own message with dense indices',()=>{
+ // Removing a leading reasoning block shifts every later block. The stored
+ // stream must be renumbered so dsh can reassemble it to the message it was
+ // logged beside; tool-call and text indices have to move together.
+ const replayState={response:{kind:'deepseek-messages',version:1,model:'test'},blocks:[{type:'reasoning'},{type:'tool-call'},{type:'text'}]}
+ const chunks=[
+  {type:'block-start',index:0,blockType:'reasoning'},
+  {type:'reasoning-delta',index:0,text:'private'},
+  {type:'block-end',index:0,block:{type:'reasoning',text:'private'}},
+  {type:'block-start',index:1,blockType:'tool-call'},
+  {type:'tool-call-delta',index:1,id:'call-1',name:'read',argumentsDelta:'{"path":'},
+  {type:'tool-call-delta',index:1,id:'call-1',argumentsDelta:'"a"}'},
+  {type:'block-end',index:1,block:{type:'tool-call',id:'call-1',name:'read',arguments:'{"path":"a"}'}},
+  {type:'block-start',index:2,blockType:'text'},
+  {type:'text-delta',index:2,text:'answer'},
+  {type:'block-end',index:2,block:{type:'text',text:'answer'}},
+  {type:'usage',usage:{inputTokens:10,outputTokens:5}},
+  {type:'finish',reason:{kind:'tool-calls'},replayState},
+ ]
+ const accumulator=new AssistantStreamAccumulator()
+ const live=new BlockAssembler()
+ for(const chunk of chunks){const timed=accumulator.push({time:1,chunk});live.push(timed.chunk)}
+ const s=make();const undo=interceptAppend(s)
+ const event=s.append('assistant/message',{turn:1,step:1,stream:accumulator.snapshot(),usage:live.usage,message:createAssistantMessage({content:live.blocks(),source:{provider:'deepseek-account',model:'test',replayState}})},{surfaceOp:'append'})
+ assert.deepEqual(event.data.message.content.map(block=>block.type),['tool-call','text'])
+ const indices=[]
+ const restored=new BlockAssembler()
+ for(const member of expandAssistantStream(event.data.stream)){
+  if(member.chunk.type==='block-start') indices.push(member.chunk.index)
+  restored.push(member.chunk)
+ }
+ assert.deepEqual(indices,[0,1],'surviving blocks are dense after the reasoning block is removed')
+ assert.deepEqual(restored.blocks(),event.data.message.content,'content must reassemble')
+ assert.deepEqual(restored.usage,event.data.usage,'usage must reassemble')
+ assert.deepEqual(restored.replayState,event.data.message.source.replayState,'both sides must have dropped the envelope')
  undo()
 })
 test('a session created while the occupancy unit is registering is still sanitized',async()=>{

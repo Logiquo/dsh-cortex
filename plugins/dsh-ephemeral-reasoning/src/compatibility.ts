@@ -5,7 +5,7 @@ import sessionPackage from '@deepseek-ai/dsh-session/package.json' with { type: 
 import llmPackage from '@deepseek-ai/dsh-llm/package.json' with { type: 'json' }
 import meterPackage from '@deepseek-ai/dsh-token-meter/package.json' with { type: 'json' }
 
-export const SUPPORTED_DSH_VERSION = '0.2.2-rc.1'
+export const SUPPORTED_DSH_VERSION = '0.2.2-rc.5'
 const versions = {
   '@deepseek-ai/dsh-agent': agentPackage.version,
   '@deepseek-ai/dsh-session': sessionPackage.version,

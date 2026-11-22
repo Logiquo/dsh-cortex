@@ -123,6 +123,69 @@ export function cleanStream(stream: readonly AssistantStreamRecord[], stripRepla
   return result
 }
 
+/** Whether a value is a plain JSON object rather than an array or scalar. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Whether a value is a block index the renumbering can trust. */
+function isIndex(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+/**
+ * Whether every content block carries the discriminator sanitation reads.
+ *
+ * Filtering and pricing dereference `block.type` and a reasoning block's
+ * `text`, so a block this predicate rejects must be admitted without
+ * sanitation rather than throw or be read as reasoning.
+ * @param value - message content, as the producer wrote it.
+ * @returns true when every block is a readable object.
+ */
+function readableContent(value: unknown): boolean {
+  return Array.isArray(value) && value.every(block => isRecord(block)
+    && typeof block['type'] === 'string'
+    && (block['type'] !== 'reasoning' || typeof block['text'] === 'string'))
+}
+
+/**
+ * Whether every stream record is well-formed enough to rewrite exactly.
+ *
+ * `cleanStream` renumbers by record index and removes reasoning records; a
+ * record missing its discriminator or index would be silently reshaped (a
+ * string would even spread into an object), so a stream this predicate rejects
+ * is left untouched with its message.
+ * @param value - embedded assistant stream, as the producer wrote it.
+ * @returns true when every record is a readable record of a known kind.
+ */
+function readableStream(value: unknown): boolean {
+  if (!Array.isArray(value)) return false
+  return value.every((record) => {
+    if (!isRecord(record)) return false
+    if (record['type'] === 'chunk') {
+      const chunk = record['chunk']
+      if (!isRecord(chunk) || typeof chunk['type'] !== 'string') return false
+      if (chunk['type'] === 'block-end') {
+        return isIndex(chunk['index']) && isRecord(chunk['block']) && typeof chunk['block']['type'] === 'string'
+      }
+      if (chunk['type'] === 'block-start') return isIndex(chunk['index']) && typeof chunk['blockType'] === 'string'
+      if (chunk['type'] === 'text-delta' || chunk['type'] === 'reasoning-delta' || chunk['type'] === 'tool-call-delta') {
+        return isIndex(chunk['index'])
+      }
+      return true
+    }
+    if (record['type'] === 'text-chunks' || record['type'] === 'reasoning-chunks') {
+      return isIndex(record['index']) && typeof record['time0'] === 'number'
+        && Array.isArray(record['dt']) && Array.isArray(record['texts'])
+    }
+    if (record['type'] === 'tool-call-chunks') {
+      return isIndex(record['index']) && typeof record['time0'] === 'number'
+        && Array.isArray(record['dt']) && Array.isArray(record['args'])
+    }
+    return false
+  })
+}
+
 /**
  * Sanitize one event payload.
  *
@@ -146,21 +209,26 @@ export function cleanStream(stream: readonly AssistantStreamRecord[], stripRepla
  */
 function cleanData(type: string, data: unknown): unknown {
   if (type === 'assistant/attempt') {
-    if (typeof data !== 'object' || data === null) return data
+    if (!isRecord(data) || !readableStream(data['stream'])) return data
     const attempt = data as SessionEventMap['assistant/attempt']
-    if (!Array.isArray(attempt.stream)) return data
     // A settlement that committed no surface message has no stored message to
     // agree with, so only a stream that lost blocks gives up its envelope.
     return { ...attempt, stream: cleanStream(attempt.stream, streamHadReasoning(attempt.stream)) }
   }
   if (type !== 'assistant/message') return data
-  if (typeof data !== 'object' || data === null) return data
+  if (!isRecord(data)) return data
   const response = data as SessionEventMap['assistant/message']
   const message = response.message
-  if (typeof message !== 'object' || message === null || !Array.isArray(message.content)) return data
+  if (!isRecord(message) || !readableContent(message.content)) return data
+  // The message and its stream must agree on the blocks they describe, so a
+  // stream this sanitizer cannot rewrite exactly is left with the message.
+  if (response.stream !== undefined && !readableStream(response.stream)) return data
   const content = message.content.filter(block => block.type !== 'reasoning')
   const evidence = reasoningEvidence(message.content)
   const stripReplayState = evidence.removedTokens > 0
+  // Dropping the envelope rewrites `source`; an absent or non-object source is
+  // beyond this sanitizer, so the settlement is admitted as written.
+  if (stripReplayState && !isRecord(message.source)) return data
   // A settlement whose `stream` is absent is admitted unchanged; older writers
   // and third-party loops omit it, and a sanitizer must never be the reason a
   // write fails.
@@ -172,6 +240,29 @@ function cleanData(type: string, data: unknown): unknown {
     ...repaired,
     message: freezeMessage({ ...message, source, content }),
   }
+}
+
+/**
+ * Sanitize one member of a batch append without changing its declared shape.
+ *
+ * dsh's batch overload takes positional tuples (`[type, data, opts?]`), so the
+ * payload is element 1 and the tuple itself must stay a tuple: spreading it
+ * into an object would hand the host a payload-less record and lose the event.
+ * The object form is retained for builds whose batch input is an
+ * `{ type, data }` record.
+ * @param input - one batch member, as the caller wrote it.
+ * @returns the same shape with its payload sanitized.
+ */
+function cleanInput(input: unknown): unknown {
+  if (Array.isArray(input)) {
+    const [type, data, ...opts] = input
+    return typeof type === 'string' ? [type, cleanData(type, data), ...opts] : input
+  }
+  if (typeof input === 'object' && input !== null) {
+    const record = input as { type?: unknown; data?: unknown }
+    return typeof record.type === 'string' ? { ...input, data: cleanData(record.type, record.data) } : input
+  }
+  return input
 }
 
 /**
@@ -193,8 +284,9 @@ export function interceptAppend(session: Session): () => void {
     if (!active) return Reflect.apply(original, this, args)
     const [type, data, ...opts] = args
     if (typeof type === 'string') return Reflect.apply(original, this, [type, cleanData(type, data), ...opts])
-    // Retain compatibility with batch-capable builds; pinned rc.1 may reject batches.
-    if (Array.isArray(type)) return Reflect.apply(original, this, [type.map(input => ({ ...input, data: cleanData(input.type, input.data) })), ...opts])
+    // The batch overload commits several events at once; sanitize every member
+    // before the host validates and freezes the candidates.
+    if (Array.isArray(type)) return Reflect.apply(original, this, [type.map(cleanInput), ...opts])
     return Reflect.apply(original, this, args)
   } as Session['append']
   const undo = patchMethod(session, 'append', append)

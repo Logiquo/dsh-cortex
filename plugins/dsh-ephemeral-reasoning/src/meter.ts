@@ -337,6 +337,12 @@ interface PressureUnit {
     }
   }
   cells: WeakMap<object, unknown>
+  /**
+   * Live registrants sharing the unit. A released predecessor stays in the
+   * table with `0`; replacing its definition would be invisible to the live
+   * drive and to a re-registration, which builds a fresh one.
+   */
+  refs?: number
 }
 
 /**
@@ -441,8 +447,11 @@ function pressureRegistration(registry: unknown): { registration: PressureUnit; 
     throw new Error(`Ephemeral reasoning: the ${PRESSURE_KEY} projection is not registered; refusing to install an unverified override`)
   }
   const original = registration.def
+  if (registration.refs === 0) {
+    throw new Error(`Ephemeral reasoning: the ${PRESSURE_KEY} projection is a released predecessor; refusing to patch a unit the live drive no longer serves (tested dsh 0.2.2-rc.5)`)
+  }
   if (original.stateVersion !== HOST_PRESSURE_VERSION || original.wire === undefined) {
-    throw new Error(`Ephemeral reasoning: unrecognized ${PRESSURE_KEY} unit (stateVersion ${original.stateVersion}); refusing to patch an unverified implementation (tested dsh 0.2.2-rc.1)`)
+    throw new Error(`Ephemeral reasoning: unrecognized ${PRESSURE_KEY} unit (stateVersion ${original.stateVersion}); refusing to patch an unverified implementation (tested dsh 0.2.2-rc.5)`)
   }
   return { registration, original }
 }
