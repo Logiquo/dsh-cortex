@@ -1,7 +1,5 @@
 import { freezeMessage } from '@deepseek-ai/dsh-llm'
-import type LlmRuntime from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, RequestMessage } from '@deepseek-ai/dsh-llm'
-import { patchMethod } from './patch.js'
+import type { RequestMessage } from '@deepseek-ai/dsh-llm'
 
 /**
  * Strip reasoning blocks and replay state from assistant messages belonging to
@@ -32,35 +30,4 @@ export function stripClosedTurnReasoning(messages: readonly RequestMessage[]): R
     return freezeMessage({ ...message, source, content })
   })
   return changed ? next : (messages as RequestMessage[])
-}
-
-/**
- * Apply {@link stripClosedTurnReasoning} to an outbound `GenerateOptions` object,
- * preserving frozen semantics when the input options are frozen.
- */
-export function stripClosedTurnOptions(options: GenerateOptions): GenerateOptions {
-  const messages = stripClosedTurnReasoning(options.messages)
-  if (messages === options.messages) return options
-  const frozenMessages = (Object.isFrozen(options.messages) ? Object.freeze(messages) : messages) as RequestMessage[]
-  const rewritten = { ...options, messages: frozenMessages }
-  return Object.isFrozen(options) ? Object.freeze(rewritten) : rewritten
-}
-
-/**
- * Patch `LlmRuntime.forAdapter` to strip reasoning from completed turns right
- * before adapter dispatch, leaving persisted session logs untouched.
- * @param llm - host `llm` service instance.
- * @returns disposer restoring the unpatched method.
- */
-export function interceptLlm(llm: LlmRuntime): () => void {
-  const target = llm as unknown as {
-    forAdapter(options: GenerateOptions, adapter: unknown): GenerateOptions
-  }
-  const original = target.forAdapter
-  let active = true
-  const undo = patchMethod(target, 'forAdapter', function (this: LlmRuntime, options: GenerateOptions, adapter: unknown) {
-    const base = original.call(this, options, adapter)
-    return active ? stripClosedTurnOptions(base) : base
-  })
-  return () => { active = false; undo() }
 }

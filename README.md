@@ -63,12 +63,16 @@ Git installs of individual monorepo subdirectories are not supported.
 
 ## Plugins
 
+- [`dsh-api-request`](plugins/dsh-api-request/README.md): shared `apiRequest` service
+  providing an ordered outbound transform pipeline, message-diff token metering,
+  and fail-closed multi-version host drivers.
+
 - [`dsh-ctx-offload`](plugins/dsh-ctx-offload/README.md): configurable early compaction,
   forward-looking execution briefs, and session-scoped history for on-demand
   delegated grep retrieval. See the [design](DESIGN.md).
 
 - [`dsh-ephemeral-reasoning`](plugins/dsh-ephemeral-reasoning/README.md):
-  version-pinned append-time sanitation and meter correction, with real-provider tests.
+  outbound closed-turn reasoning stripping and `replayState` cleanup built on `dsh-api-request`.
 
 ## References
 
