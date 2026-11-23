@@ -1,87 +1,35 @@
 # dsh-cortex
 
-Minimal workspace for DeepSeek Harness host plugins. Each plugin is an independent
-npm package and a dsh bundle; the root is private.
+A collection of DeepSeek Harness (`dsh`) plugins designed to improve `dsh`'s performance on software engineering (SWE) tasks through context offloading, outbound request transformation, reasoning cleanup, and ephemeral prompt reminders.
 
-Requires Node.js **24.9+** and npm. This small workspace uses npm; the upstream
-Harness source repository uses pnpm and has its own build pipeline.
+## Installation
 
-## Create a plugin
+Requires Node.js **24.9+** and `dsh` (`>=0.2.2-rc.1 <0.3.0`).
+
+Build the workspace and add any plugin to a `dsh` profile:
 
 ```sh
 npm install
-npm run new -- dsh-hello --scope @you --title "Hello"
+npm run build
+dsh plugin --profile <profile> add ./plugins/<plugin-name>
+```
+
+> **Note:** `dsh-ephemeral-reasoning` and `dsh-ephemeral-reminder` depend on `dsh-api-request`; add `dsh-api-request` to the same profile first.
+
+## Plugins
+
+- [`dsh-api-request`](plugins/dsh-api-request/README.md): Shared `apiRequest` service providing an ordered outbound transform pipeline, message-diff token metering, and fail-closed multi-version host drivers.
+- [`dsh-ctx-offload`](plugins/dsh-ctx-offload/README.md): Configurable early compaction, forward-looking execution briefs, and session-scoped history for on-demand delegated grep retrieval. See the [design](DESIGN.md).
+- [`dsh-ephemeral-reasoning`](plugins/dsh-ephemeral-reasoning/README.md): Outbound closed-turn reasoning stripping and `replayState` cleanup built on `dsh-api-request`.
+- [`dsh-ephemeral-reminder`](plugins/dsh-ephemeral-reminder/README.md): Outbound ephemeral `<system-reminder>` injection on the latest user message built on `dsh-api-request`.
+
+## Development
+
+```sh
 npm install
 npm run typecheck
 npm run build
 ```
-
-The generator creates `plugins/dsh-hello` from `templates/plugin` and copies the MIT
-license. The folder matches the supplied package basename (`dsh-hello`). Scoped
-packages use that same basename as their folder because a scope contains a path
-separator. Omit `--scope` to name the package `dsh-hello`. Optional `--description`
-sets the package description.
-
-```text
-plugins/<package-name>/
-  src/index.ts       # Cordis name, Config schema, inject, apply
-  package.json       # ESM exports and dsh.bundle manifest
-  cordis.patch.yml   # inserts the plugin by package name
-  tsconfig.json      # extends the root TypeScript settings
-  README.md
-  LICENSE
-```
-
-Add behavior in `apply`. Declare consumed services in `inject`, and add their
-packages to both peerDependencies and devDependencies when they must share the
-host's instance. Use `ctx.effect` for resources that need cleanup. The starter
-only needs Cordis and Schemastery; add agent, tool, or LLM APIs when needed.
-
-## Load locally
-
-With the dsh CLI installed, build first and link the plugin into a profile:
-
-```sh
-dsh plugin --profile demo add ./plugins/dsh-hello
-dsh --profile demo --dump-config
-dsh --profile demo
-```
-
-The bundle's `cordis.patch.yml` activates the package. Rebuild after source edits;
-restart dsh to load the new output.
-
-## Package
-
-```sh
-npm pack --workspace @you/dsh-hello
-```
-
-`prepack` builds the plugin before creating the tarball. Its published files
-include JavaScript, declarations, the bundle patch, README, and license.
-This template targets local links and built tarballs or registry packages.
-Git installs of individual monorepo subdirectories are not supported.
-
-## Plugins
-
-- [`dsh-api-request`](plugins/dsh-api-request/README.md): shared `apiRequest` service
-  providing an ordered outbound transform pipeline, message-diff token metering,
-  and fail-closed multi-version host drivers.
-
-- [`dsh-ctx-offload`](plugins/dsh-ctx-offload/README.md): configurable early compaction,
-  forward-looking execution briefs, and session-scoped history for on-demand
-  delegated grep retrieval. See the [design](DESIGN.md).
-
-- [`dsh-ephemeral-reasoning`](plugins/dsh-ephemeral-reasoning/README.md):
-  outbound closed-turn reasoning stripping and `replayState` cleanup built on `dsh-api-request`.
-
-## References
-
-- [Harness development guide](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/development.md)
-- [Your first plugin](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/index.md)
-- [Configuration](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/config.md)
-- [Packaging and installation](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/publish.md)
-
-Local reference material belongs in the ignored `garbage-do-not-search/` directory.
 
 ## License
 
