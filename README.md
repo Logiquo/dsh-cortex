@@ -19,7 +19,7 @@ dsh plugin --profile <profile> add ./plugins/<plugin-name>
 ## Plugins
 
 - [`dsh-api-request`](plugins/dsh-api-request/README.md): Shared `apiRequest` service providing an ordered outbound transform pipeline, message-diff token metering, and fail-closed multi-version host drivers.
-- [`dsh-ctx-offload`](plugins/dsh-ctx-offload/README.md): Configurable early compaction, forward-looking execution briefs, and session-scoped history for on-demand delegated grep retrieval. See the [design](DESIGN.md).
+- [`dsh-context-offload`](plugins/dsh-context-offload/README.md): Forward-looking execution briefs, session-scoped history archives, and built-in `history_search` / `history_read` tools built on `BasicCompactionEngine`.
 - [`dsh-ephemeral-reasoning`](plugins/dsh-ephemeral-reasoning/README.md): Outbound closed-turn reasoning stripping and `replayState` cleanup built on `dsh-api-request`.
 - [`dsh-ephemeral-reminder`](plugins/dsh-ephemeral-reminder/README.md): Outbound ephemeral `<system-reminder>` injection on the latest user message built on `dsh-api-request`.
 

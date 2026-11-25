@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, open, readFile, rename } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { extractSessionEventText } from '@deepseek-ai/dsh-session-query'
@@ -15,6 +15,15 @@ export interface Catalog {
   chunks: Chunk[]
 }
 export interface ArchiveCut { directory: string; catalog: Catalog; compaction: number; turn: number | null; compactionId: string }
+export interface EnsureOptions { verifyChunks?: boolean }
+
+interface CachedSession {
+  catalog: Catalog
+  catalogMtimeMs: number
+  catalogSize: number
+  eventRefs: readonly SessionEvent[]
+}
+
 const digest = (text: string) => createHash('sha256').update(text).digest('hex')
 const pad = (n: number) => String(n).padStart(6, '0')
 
@@ -40,9 +49,20 @@ export function renderEvents(events: readonly SessionEvent[]): string {
   return sections.join('\n')
 }
 
+function cloneCatalog(catalog: Catalog): Catalog {
+  return {
+    version: catalog.version,
+    sessionId: catalog.sessionId,
+    through: catalog.through,
+    chain: catalog.chain,
+    chunks: catalog.chunks.map(chunk => ({ ...chunk })),
+  }
+}
+
 /** Dedicated archive ownership; never registers or changes ctx.spillStore. */
 export class ArchiveStore {
   private readonly queues = new Map<string, Promise<unknown>>()
+  private readonly cache = new Map<string, CachedSession>()
   constructor(readonly root: string) {}
 
   private serial<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
@@ -54,10 +74,17 @@ export class ArchiveStore {
   }
   async drain(): Promise<void> { await Promise.all([...this.queues.values()]) }
 
+  /** Fast synchronous check whether this store has already archived events for a session. */
+  hasArchived(sessionId: string): boolean {
+    const entry = this.cache.get(sessionId)
+    return entry !== undefined && entry.catalog.through >= 0
+  }
+
   async verify(sessionId: string): Promise<Catalog | undefined> {
     const directory = sessionDir(this.root, sessionId)
+    const catalogPath = join(directory, 'catalog.json')
     let raw: string
-    try { raw = await readFile(join(directory, 'catalog.json'), 'utf8') }
+    try { raw = await readFile(catalogPath, 'utf8') }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
     const catalog = JSON.parse(raw) as Catalog
     if (catalog.version !== 1 || catalog.sessionId !== sessionId || !Array.isArray(catalog.chunks)) throw new Error('Invalid archive catalog')
@@ -73,16 +100,63 @@ export class ArchiveStore {
   }
 
   /** Capture canonical history, including records shadowed by previous compactions. */
-  ensure(sessionId: string, events: readonly SessionEvent[], signal?: AbortSignal): Promise<ArchiveCut> {
+  ensure(sessionId: string, events: readonly SessionEvent[], signal?: AbortSignal, options?: EnsureOptions): Promise<ArchiveCut> {
     return this.serial(sessionId, async () => {
       signal?.throwIfAborted()
       const directory = sessionDir(this.root, sessionId)
+      const catalogPath = join(directory, 'catalog.json')
       await mkdir(directory, { recursive: true, mode: 0o700 })
-      return withFileLock(join(directory, 'catalog.json'), async () => {
-        const previous = await this.verify(sessionId)
+      return withFileLock(catalogPath, async () => {
+        const cached = this.cache.get(sessionId)
+        let previous: Catalog | undefined
+        let cacheHit = false
+
+        if (cached !== undefined && options?.verifyChunks !== true) {
+          try {
+            const info = await stat(catalogPath)
+            if (info.mtimeMs === cached.catalogMtimeMs && info.size === cached.catalogSize) {
+              previous = cloneCatalog(cached.catalog)
+              cacheHit = true
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+          }
+        }
+
+        if (!cacheHit) {
+          previous = await this.verify(sessionId)
+        }
+
         let chain = ''
         let prefix = previous === undefined || previous.through === -1
-        for (const [index, event] of events.entries()) {
+        let startIndex = 0
+
+        // Fast path: when cached event object references match the archived prefix identically,
+        // skip re-serializing and re-hashing the already-verified prefix.
+        if (
+          cacheHit &&
+          cached !== undefined &&
+          previous !== undefined &&
+          previous.through >= 0 &&
+          events.length > previous.through &&
+          cached.eventRefs.length > previous.through
+        ) {
+          let identicalRefs = true
+          for (let i = 0; i <= previous.through; i++) {
+            if (events[i] !== cached.eventRefs[i]) {
+              identicalRefs = false
+              break
+            }
+          }
+          if (identicalRefs) {
+            chain = previous.chain
+            prefix = true
+            startIndex = previous.through + 1
+          }
+        }
+
+        for (let index = startIndex; index < events.length; index++) {
+          const event = events[index]!
           if (Number(event.seq) !== index) throw new Error('Canonical history is not contiguous from event 0')
           chain = digest(`${chain}\n${JSON.stringify(event)}`)
           if (index === previous?.through) {
@@ -91,6 +165,7 @@ export class ArchiveStore {
           }
         }
         if (!prefix) throw new Error('Canonical history is shorter than archived history')
+
         const starts = events.filter(event => event.type === 'compaction/start')
         const latest = starts.at(-1)
         const compaction = starts.length
@@ -101,7 +176,7 @@ export class ArchiveStore {
         if (pending.length > 0) {
           const from = catalog.through + 1
           const through = events.length - 1
-          const name = `ctx-offload-c${pad(compaction)}-${turn === null ? 'idle' : `turn${pad(turn)}`}-events${pad(from)}-${pad(through)}.txt`
+          const name = `context-offload-c${pad(compaction)}-${turn === null ? 'idle' : `turn${pad(turn)}`}-events${pad(from)}-${pad(through)}.txt`
           const text = renderEvents(pending)
           const saved = await saveTextFile({ root: this.root, sessionId, suggestedName: `${name}.pending`, content: text })
           await syncFile(saved.path)
@@ -112,8 +187,17 @@ export class ArchiveStore {
           catalog.chunks.push({ file: basename(path), from, through, sha256: digest(text) })
           catalog.through = through
           catalog.chain = chain
-          await publish(join(directory, 'catalog.json'), JSON.stringify(catalog, null, 2) + '\n')
+          await publish(catalogPath, JSON.stringify(catalog, null, 2) + '\n')
           await syncDirectory(directory)
+        }
+        if (catalog.through >= 0) {
+          const info = await stat(catalogPath)
+          this.cache.set(sessionId, {
+            catalog: cloneCatalog(catalog),
+            catalogMtimeMs: info.mtimeMs,
+            catalogSize: info.size,
+            eventRefs: events.slice(0, catalog.through + 1),
+          })
         }
         return { directory, catalog, compaction, turn, compactionId }
       }, signal ? { signal } : {})

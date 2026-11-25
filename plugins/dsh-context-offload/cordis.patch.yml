@@ -3,5 +3,5 @@
   disabled: true
 
 - insert:
-    - id: dsh-ctx-offload
-      name: dsh-ctx-offload
+    - id: dsh-context-offload
+      name: dsh-context-offload

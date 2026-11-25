@@ -3,8 +3,7 @@
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "lib",
-    "declarationDir": "lib/types",
-    "resolveJsonModule": true
+    "declarationDir": "lib/types"
   },
   "include": [
     "src"
