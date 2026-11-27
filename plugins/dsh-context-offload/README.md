@@ -49,10 +49,10 @@ When opened on an existing session that has not yet been indexed (or after `/con
 
 ## Built-in history tools
 
-Once a main-agent session has been compacted (`replaceGeneration > 0`), two read-only, concurrency-safe tools activate automatically (consuming zero tool schema tokens prior to compaction):
+On every main-agent session (from turn 1, covering both `[compacted]` and `[in-context]` history), two read-only, concurrency-safe tools are registered:
 
-- `history_search`: unified search over `offload.sqlite` (`mode`: `"hybrid"` default, `"lexical"`, or `"semantic"`). Runs streaming exact/regex search over `events` and, when `dsh-context-guard` is mounted (`ctx.contextGuard.semanticSearch`), automatically fuses non-overlapping semantic micro-card matches in the same call.
-- `history_read`: `O(1)` primary-key range read (`fromId`..`toId`, up to 20 events per call) with `maxChars` and `charOffset` pagination.
+- `history_search`: unified search over `offload.sqlite` (`mode`: `"hybrid"` default, `"lexical"`, or `"semantic"`). Runs streaming exact/regex search over raw `events` and, when `dsh-context-guard` is mounted (`ctx.contextGuard`), simultaneously runs exact/regex search over step summaries (`lexicalSearch`) and vector similarity (`semanticSearch`) with overlap deduplication. Every hit is tagged `[compacted]` or `[in-context]`.
+- `history_read`: `O(1)` primary-key range read (`fromId`..`toId`) supporting `detail: "full"` (default, up to 20 events with verbatim text) or `detail: "summary"` (up to 200 events, using `dsh-context-guard` micro-card summaries when active or head+tail truncation otherwise), with `maxChars` and `charOffset` pagination.
 
 ## Commands
 

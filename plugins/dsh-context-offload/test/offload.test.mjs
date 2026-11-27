@@ -389,26 +389,31 @@ test('history_search and history_read query offload.sqlite and support hybrid se
   assert.equal(searchEntry.definition.isConcurrencySafe({ query: 'violet' }), true)
   assert.equal(readEntry.definition.isConcurrencySafe({ fromId: 0 }), true)
 
-  assert.equal(searchEntry.options.when({ agent }), false)
-  assert.equal(readEntry.options.when({ agent }), false)
+  // Tools are active on main-agent sessions from turn 1 (before compaction), and never on subagents.
+  assert.equal(searchEntry.options.when({ agent }), true)
+  assert.equal(readEntry.options.when({ agent }), true)
+  const subSession = ctx.sessions.create(SessionId(crypto.randomUUID()), { meta: { origin: 'subagent' } })
+  assert.equal(searchEntry.options.when({ agent: { session: subSession } }), false)
+  assert.equal(readEntry.options.when({ agent: { session: subSession } }), false)
 
   conversation(session, 1, 'Early requirement: token=violet-42.\n' + 'padding line\n'.repeat(6000))
   await ctx.compaction.compactNow(agent, new AbortController().signal)
   conversation(session, 2, 'Later correction: token=violet-99 supersedes violet-42.')
 
-  assert.equal(searchEntry.options.when({ agent }), true)
-  assert.equal(readEntry.options.when({ agent }), true)
-  const subSession = ctx.sessions.create(SessionId(crypto.randomUUID()), { origin: 'subagent' })
-  assert.equal(searchEntry.options.when({ agent: { session: subSession } }), false)
-
   const exec = { agent, signal: new AbortController().signal }
 
-  // Default hybrid mode gracefully falls back to lexical when dsh-context-guard is not mounted.
+  // Default hybrid mode gracefully falls back to lexical when dsh-context-guard is not mounted,
+  // and tags compacted vs in-context hits accurately.
   const searchRes = await searchEntry.definition.execute({ query: 'violet-' }, exec)
   assert.equal(searchRes.modeUsed, 'lexical')
+  assert.ok(searchRes.compactedThroughId >= 0)
   assert.ok(searchRes.totalLexicalMatches >= 2)
   assert.match(searchRes.lexicalMatches[0].snippet, /violet-99/)
-  assert.ok(searchRes.lexicalMatches.some(m => m.snippet.includes('violet-42')))
+  assert.equal(searchRes.lexicalMatches[0].scope, 'in-context')
+  const earlyMatch = searchRes.lexicalMatches.find(m => m.snippet.includes('violet-42') && m.id <= searchRes.compactedThroughId)
+  assert.ok(earlyMatch)
+  assert.equal(earlyMatch.scope, 'compacted')
+  assert.deepEqual(searchRes.summaryLexicalMatches, [])
   assert.deepEqual(searchRes.semanticMatches, [])
 
   // Explicit semantic mode errors cleanly when guard is absent.
@@ -425,24 +430,53 @@ test('history_search and history_read query offload.sqlite and support hybrid se
   assert.equal(oldestRes.lexicalMatches.length, 1)
   assert.equal(oldestRes.hasMoreLexical, true)
   assert.match(oldestRes.lexicalMatches[0].snippet, /violet-42/)
+  assert.equal(oldestRes.lexicalMatches[0].scope, 'compacted')
 
   await assert.rejects(
     searchEntry.definition.execute({ query: '[invalid', regex: true }, exec),
     /Invalid regex/,
   )
 
-  // Mount a mock dsh-context-guard semanticSearch provider and verify hybrid fusion + regex stripping + dedup.
-  const capturedQueries = []
+  // history_read(detail: 'summary') without guard uses head+tail truncation and tags [compacted]/[in-context].
   const hitId = oldestRes.lexicalMatches[0].id
+  const truncSummary = await readEntry.definition.execute({ fromId: hitId, toId: hitId, detail: 'summary' }, exec)
+  assert.equal(truncSummary.detailUsed, 'summary')
+  assert.equal(truncSummary.summarySource, 'truncated')
+  assert.match(truncSummary.content, /\[compacted\]/)
+  assert.match(truncSummary.content, /chars omitted/)
+
+  // Mount a mock dsh-context-guard provider supporting semanticSearch + lexicalSearch + listSummaries.
+  const capturedQueries = []
+  const lastEventId = searchRes.totalEvents - 1
   ctx.provide('contextGuard', {
     async semanticSearch(_sessionId, q) {
       capturedQueries.push(q)
       return [
         // Overlaps lexical hitId -> should be deduplicated out in hybrid mode
         { cardIdx: 0, startId: hitId, endId: hitId, kind: 'constraint', score: 0.95, micro: '#0 [USER] Early violet-42' },
+        // Overlaps summaryLexical hit -> should also be deduplicated out in hybrid mode
+        { cardIdx: 1, startId: hitId + 1, endId: hitId + 2, kind: 'constraint', score: 0.90, micro: '#1 [USER] Summary-only violet-77' },
         // Distinct semantic hit -> should be included
         { cardIdx: 2, startId: hitId + 3, endId: hitId + 4, kind: 'assistant', score: 0.84, micro: '#2 [ASSISTANT] Completed turn 1.' },
       ]
+    },
+    async lexicalSearch(_sessionId, opts) {
+      assert.equal(opts.regex, true)
+      return [
+        // Overlaps lexical hitId -> deduplicated
+        { cardIdx: 0, startId: hitId, endId: hitId, kind: 'constraint', micro: '#0 [USER] Early violet-42' },
+        // Distinct summary-only regex hit -> included
+        { cardIdx: 1, startId: hitId + 1, endId: hitId + 2, kind: 'constraint', micro: '#1 [USER] Summary-only violet-77' },
+      ]
+    },
+    async listSummaries(_sessionId, range) {
+      // Simulate guard indexed through compactedThroughId (lagging behind latest events -> tests 'guard' & 'mixed')
+      return {
+        throughEventId: searchRes.compactedThroughId,
+        cards: [
+          { cardIdx: 0, startId: hitId, endId: hitId, kind: 'constraint', micro: '#0 [USER] Early violet-42' },
+        ].filter(c => c.endId >= range.fromId && c.startId <= range.toId),
+      }
     },
   })
 
@@ -453,15 +487,31 @@ test('history_search and history_read query offload.sqlite and support hybrid se
   assert.equal(hybridRes.modeUsed, 'hybrid')
   assert.equal(capturedQueries[0], 'violet-')
   assert.equal(hybridRes.lexicalMatches.length, 1)
+  assert.equal(hybridRes.summaryLexicalMatches.length, 1)
+  assert.equal(hybridRes.summaryLexicalMatches[0].cardIdx, 1)
   assert.equal(hybridRes.semanticMatches.length, 1)
   assert.equal(hybridRes.semanticMatches[0].cardIdx, 2)
 
-  // history_read reads the exact shadowed event directly from offload.sqlite with pagination.
+  // history_read(detail: 'summary') with guard: covered range uses 'guard', range extending past guard uses 'mixed'.
+  const guardSummary = await readEntry.definition.execute({ fromId: hitId, toId: searchRes.compactedThroughId, detail: 'summary' }, exec)
+  assert.equal(guardSummary.summarySource, 'guard')
+  assert.match(guardSummary.content, /card #0/)
+  assert.match(guardSummary.content, /compacted/)
+
+  const mixedSummary = await readEntry.definition.execute({ fromId: hitId, toId: lastEventId, detail: 'summary' }, exec)
+  assert.equal(mixedSummary.summarySource, 'mixed')
+  assert.match(mixedSummary.content, /card #0/)
+  assert.match(mixedSummary.content, /\[in-context\]/)
+
+  // history_read(detail: 'full') reads the exact shadowed event directly from offload.sqlite with pagination + [compacted] tag.
   const page1 = await readEntry.definition.execute({ fromId: hitId, maxChars: 200, charOffset: 0 }, exec)
+  assert.equal(page1.detailUsed, 'full')
+  assert.equal(page1.summarySource, 'none')
   assert.equal(page1.fromId, hitId)
   assert.equal(page1.toId, hitId)
   assert.equal(page1.truncated, true)
   assert.equal(page1.nextCharOffset, 200)
+  assert.match(page1.content, /\[compacted\]/)
   assert.match(page1.content, /Early requirement: token=violet-42/)
 
   const page2 = await readEntry.definition.execute({ fromId: hitId, maxChars: 200, charOffset: page1.nextCharOffset }, exec)

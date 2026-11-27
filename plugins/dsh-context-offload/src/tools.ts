@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolActivationContext } from '@deepseek-ai/dsh-tools'
-import type { ArchiveStore, LexicalMatch } from './archive.js'
+import type { ArchiveStore, LexicalMatch, StoredEventRow } from './archive.js'
 
 const MAX_SEARCH_LIMIT = 30
 const DEFAULT_SEARCH_LIMIT = 8
@@ -10,10 +10,14 @@ const MIN_SNIPPET_CHARS = 80
 const MAX_SNIPPET_CHARS = 1000
 const DEFAULT_SNIPPET_CHARS = 300
 
-const MAX_READ_EVENTS = 20
+const MAX_READ_EVENTS_FULL = 20
+const MAX_READ_EVENTS_SUMMARY = 200
 const MIN_READ_CHARS = 200
 const MAX_READ_CHARS = 20000
 const DEFAULT_READ_CHARS = 6000
+const SUMMARY_EDGE_CHARS = 150
+
+export type HistoryScope = 'compacted' | 'in-context' | 'mixed'
 
 export interface SemanticSearchHit {
   cardIdx: number
@@ -24,12 +28,39 @@ export interface SemanticSearchHit {
   micro: string
 }
 
-export interface SemanticSearchProvider {
+export interface SummaryCardItem {
+  cardIdx: number
+  startId: number
+  endId: number
+  kind: string
+  micro: string
+}
+
+export interface SummaryRangeResult {
+  throughEventId: number
+  cards: SummaryCardItem[]
+}
+
+export interface SummaryLexicalSearchOptions {
+  query: string
+  regex?: boolean
+  caseSensitive?: boolean
+  kinds?: string[]
+  fromId?: number
+  toId?: number
+  order?: 'newest' | 'oldest'
+  limit: number
+  signal?: AbortSignal
+}
+
+export interface ContextGuardProvider {
   semanticSearch(
     sessionId: string,
     query: string,
     options: { topK: number; fromId?: number; toId?: number; signal?: AbortSignal },
   ): Promise<SemanticSearchHit[]>
+  lexicalSearch?(sessionId: string, options: SummaryLexicalSearchOptions): Promise<SummaryCardItem[]>
+  listSummaries?(sessionId: string, options?: { fromId?: number; toId?: number }): Promise<SummaryRangeResult>
 }
 
 export interface HistoryToolsDeps {
@@ -49,19 +80,70 @@ function stripRegexMeta(pattern: string): string {
     .trim()
 }
 
-function getSemanticProvider(ctx: Context): SemanticSearchProvider | undefined {
+function getGuardProvider(ctx: Context): ContextGuardProvider | undefined {
   const getter = (ctx as unknown as { get?: (name: string) => unknown }).get
   const candidate = (typeof getter === 'function' ? getter.call(ctx, 'contextGuard') : undefined) as
-    | Partial<SemanticSearchProvider>
+    | Partial<ContextGuardProvider>
     | undefined
   if (candidate && typeof candidate.semanticSearch === 'function') {
-    return candidate as SemanticSearchProvider
+    return candidate as ContextGuardProvider
   }
   return undefined
 }
 
+/** Always expose history tools on main-agent sessions (covers both compacted and in-context history). */
 function shouldActivate({ agent }: ToolActivationContext): boolean {
-  return agent.session.header.origin !== 'subagent' && agent.session.surface.replaceGeneration > 0
+  return agent.session.header.origin !== 'subagent'
+}
+
+function scopeForId(id: number, compactedThroughId: number): 'compacted' | 'in-context' {
+  return id <= compactedThroughId ? 'compacted' : 'in-context'
+}
+
+function scopeForRange(startId: number, endId: number, compactedThroughId: number): HistoryScope {
+  if (endId <= compactedThroughId) return 'compacted'
+  if (startId > compactedThroughId) return 'in-context'
+  return 'mixed'
+}
+
+function formatScopeTag(scope: HistoryScope): string {
+  return scope === 'mixed' ? 'compacted+in-context' : scope
+}
+
+function formatCompactedHeader(compactedThroughId: number): string {
+  return compactedThroughId >= 0 ? `compacted<=${compactedThroughId}` : 'no compaction yet'
+}
+
+function formatHeadTailSummary(text: string, edgeChars = SUMMARY_EDGE_CHARS): string {
+  if (text.length === 0) return '(no text content)'
+  if (text.length <= edgeChars * 2 + 40) return text
+  const omitted = text.length - edgeChars * 2
+  return `${text.slice(0, edgeChars)}\n... [${omitted} chars omitted] ...\n${text.slice(-edgeChars)}`
+}
+
+function formatTruncatedEvent(row: StoredEventRow, compactedThroughId: number): string {
+  const scope = scopeForId(row.id, compactedThroughId)
+  return `=== event ${row.id} [${scope}]: ${row.type} (${row.textLen} chars) ===\n${formatHeadTailSummary(row.text)}`
+}
+
+function formatGuardSummaryCard(card: SummaryCardItem, compactedThroughId: number): string {
+  const scope = formatScopeTag(scopeForRange(card.startId, card.endId, compactedThroughId))
+  return `[ids ${card.startId}..${card.endId} | ${scope} | card #${card.cardIdx} | ${card.kind}] ${card.micro}`
+}
+
+function mapEventTypesToCardKinds(eventTypes: readonly string[] | undefined): string[] | undefined {
+  if (!eventTypes || eventTypes.length === 0) return undefined
+  const kinds = new Set<string>()
+  for (const type of eventTypes) {
+    if (type === 'user/message') kinds.add('constraint')
+    else if (type === 'tool/call' || type === 'tool/result') kinds.add('action')
+    else if (type === 'assistant/message') kinds.add('assistant')
+  }
+  return [...kinds]
+}
+
+function overlapsRange(startA: number, endA: number, startB: number, endB: number): boolean {
+  return startA <= endB && startB <= endA
 }
 
 export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () => void {
@@ -69,7 +151,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
     defineTool({
       name: 'history_search',
       description:
-        'Search earlier canonical history of the current session (including compacted turns). Defaults to `hybrid` mode (exact/regex match on raw events + semantic similarity on micro-cards when dsh-context-guard is active). Returns event ids and concise snippets/summaries; call `history_read` to inspect full text around any matched id.',
+        'Search canonical history of the current session across both [compacted] and [in-context] turns. Defaults to `hybrid` mode: exact/regex match on raw full-text events, plus exact/regex match and semantic similarity on step summaries when dsh-context-guard is active. Call `history_read` to inspect full text or browse summaries around any matched id.',
       parameters: {
         query: {
           type: 'string',
@@ -80,7 +162,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
           type: 'string',
           enum: ['hybrid', 'lexical', 'semantic'],
           description:
-            'Search mode: "hybrid" (default, combines exact/regex + semantic when available), "lexical" (exact/regex only), or "semantic" (vector similarity only).',
+            'Search mode: "hybrid" (default, combines full-text lexical/regex + summary lexical/regex + semantic when available), "lexical" (exact/regex over full-text and summaries when available), or "semantic" (vector similarity only).',
         },
         regex: {
           type: 'boolean',
@@ -111,7 +193,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
         },
         limit: {
           type: 'integer',
-          description: `Max lexical matches to return (1..${MAX_SEARCH_LIMIT}, default ${DEFAULT_SEARCH_LIMIT}). In hybrid mode, also returns up to min(limit, 8) non-overlapping semantic matches.`,
+          description: `Max lexical matches to return (1..${MAX_SEARCH_LIMIT}, default ${DEFAULT_SEARCH_LIMIT}). In hybrid mode, also returns up to min(limit, 8) non-overlapping summary/semantic matches.`,
         },
         snippetChars: {
           type: 'integer',
@@ -124,6 +206,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
           additionalProperties: false,
           properties: {
             modeUsed: { type: 'string', enum: ['hybrid', 'lexical', 'semantic'], required: true },
+            compactedThroughId: { type: 'integer', required: true },
             lexicalMatches: {
               type: 'array',
               required: true,
@@ -133,8 +216,25 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
                 properties: {
                   id: { type: 'integer', required: true },
                   type: { type: 'string', required: true },
+                  scope: { type: 'string', enum: ['compacted', 'in-context'], required: true },
                   snippet: { type: 'string', required: true },
                   textLength: { type: 'integer', required: true },
+                },
+              },
+            },
+            summaryLexicalMatches: {
+              type: 'array',
+              required: true,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  cardIdx: { type: 'integer', required: true },
+                  startId: { type: 'integer', required: true },
+                  endId: { type: 'integer', required: true },
+                  kind: { type: 'string', required: true },
+                  scope: { type: 'string', enum: ['compacted', 'in-context', 'mixed'], required: true },
+                  micro: { type: 'string', required: true },
                 },
               },
             },
@@ -149,6 +249,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
                   startId: { type: 'integer', required: true },
                   endId: { type: 'integer', required: true },
                   kind: { type: 'string', required: true },
+                  scope: { type: 'string', enum: ['compacted', 'in-context', 'mixed'], required: true },
                   score: { type: 'number', required: true },
                   micro: { type: 'string', required: true },
                 },
@@ -162,26 +263,40 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
           },
         },
         render: (args, value) => {
-          if (value.lexicalMatches.length === 0 && value.semanticMatches.length === 0) {
+          const compactInfo = formatCompactedHeader(value.compactedThroughId)
+          if (
+            value.lexicalMatches.length === 0 &&
+            value.summaryLexicalMatches.length === 0 &&
+            value.semanticMatches.length === 0
+          ) {
             return [{
               type: 'text',
-              text: `No matches for ${JSON.stringify(args.query)} (mode=${value.modeUsed}, events ${value.scannedFrom}..${value.scannedTo}, ${value.totalEvents} total events).`,
+              text: `No matches for ${JSON.stringify(args.query)} (mode=${value.modeUsed}, events ${value.scannedFrom}..${value.scannedTo}, ${compactInfo}, ${value.totalEvents} total events).`,
             }]
           }
           const sections: string[] = [
-            `Search ${JSON.stringify(args.query)} (mode=${value.modeUsed}, events ${value.scannedFrom}..${value.scannedTo}):`,
+            `Search ${JSON.stringify(args.query)} (mode=${value.modeUsed}, events ${value.scannedFrom}..${value.scannedTo}, ${compactInfo}):`,
           ]
           if (value.lexicalMatches.length > 0) {
-            const head = `Exact matches (${value.lexicalMatches.length} of ${value.totalLexicalMatches}${value.hasMoreLexical ? ', more available' : ''}):`
+            const head = `Exact matches in full text (${value.lexicalMatches.length} of ${value.totalLexicalMatches}${value.hasMoreLexical ? ', more available' : ''}):`
             const body = value.lexicalMatches
-              .map(m => `[id ${m.id} | ${m.type} | ${m.textLength} chars]\n${m.snippet}`)
+              .map(m => `[id ${m.id} | ${m.scope} | ${m.type} | ${m.textLength} chars]\n${m.snippet}`)
               .join('\n\n')
             sections.push(`${head}\n${body}`)
           }
+          if (value.summaryLexicalMatches.length > 0) {
+            const n = value.summaryLexicalMatches.length
+            const head = `Exact matches in summaries (${n} additional step${n === 1 ? '' : 's'}):`
+            const body = value.summaryLexicalMatches
+              .map(s => `[ids ${s.startId}..${s.endId} | ${formatScopeTag(s.scope)} | card #${s.cardIdx} | ${s.kind}] ${s.micro}`)
+              .join('\n')
+            sections.push(`${head}\n${body}`)
+          }
           if (value.semanticMatches.length > 0) {
-            const head = `Semantic matches (${value.semanticMatches.length} related step${value.semanticMatches.length === 1 ? '' : 's'}):`
+            const n = value.semanticMatches.length
+            const head = `Semantic matches (${n} related step${n === 1 ? '' : 's'}):`
             const body = value.semanticMatches
-              .map(s => `[ids ${s.startId}..${s.endId} | card #${s.cardIdx} | ${s.kind} | score=${s.score.toFixed(2)}] ${s.micro}`)
+              .map(s => `[ids ${s.startId}..${s.endId} | ${formatScopeTag(s.scope)} | card #${s.cardIdx} | ${s.kind} | score=${s.score.toFixed(2)}] ${s.micro}`)
               .join('\n')
             sections.push(`${head}\n${body}`)
           }
@@ -195,7 +310,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
         if (query.length === 0) throw new Error('history_search requires a non-empty query')
 
         const requestedMode = args.mode ?? 'hybrid'
-        const provider = getSemanticProvider(ctx)
+        const provider = getGuardProvider(ctx)
         if (requestedMode === 'semantic' && !provider) {
           throw new Error('Semantic history search requires dsh-context-guard to be installed and active')
         }
@@ -207,8 +322,9 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
 
         await deps.syncSession(exec.agent.session, exec.signal)
         const sessionId = exec.agent.session.id
+        const compactedThroughId = await deps.archives.getCompactedThroughId(sessionId)
 
-        let lexicalMatches: LexicalMatch[] = []
+        let rawLexicalMatches: LexicalMatch[] = []
         let totalLexicalMatches = 0
         let scannedFrom = 0
         let scannedTo = -1
@@ -227,7 +343,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
             snippetChars,
             signal: exec.signal,
           })
-          lexicalMatches = lex.matches
+          rawLexicalMatches = lex.matches
           totalLexicalMatches = lex.totalMatches
           scannedFrom = lex.scannedFrom
           scannedTo = lex.scannedTo
@@ -240,33 +356,79 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
           }
         }
 
-        let semanticMatches: SemanticSearchHit[] = []
+        const lexicalMatches = rawLexicalMatches.map(m => ({
+          ...m,
+          scope: scopeForId(m.id, compactedThroughId),
+        }))
+
+        const lexIds = new Set(lexicalMatches.map(m => m.id))
+
+        let summaryLexicalMatches: Array<SummaryCardItem & { scope: HistoryScope }> = []
+        if ((modeUsed === 'lexical' || modeUsed === 'hybrid') && provider?.lexicalSearch) {
+          const mappedKinds = mapEventTypesToCardKinds(args.eventTypes)
+          if (!args.eventTypes || (mappedKinds && mappedKinds.length > 0)) {
+            const summaryCap = Math.min(limit, 8)
+            const rawSumHits = await provider.lexicalSearch(sessionId, {
+              query,
+              regex: args.regex === true,
+              caseSensitive: args.caseSensitive === true,
+              ...(mappedKinds ? { kinds: mappedKinds } : {}),
+              ...(args.fromId !== undefined ? { fromId: args.fromId } : {}),
+              ...(args.toId !== undefined ? { toId: args.toId } : {}),
+              order: args.order ?? 'newest',
+              limit: summaryCap + lexicalMatches.length,
+              ...(exec.signal ? { signal: exec.signal } : {}),
+            })
+            summaryLexicalMatches = rawSumHits
+              .filter(hit => {
+                for (const id of lexIds) {
+                  if (id >= hit.startId && id <= hit.endId) return false
+                }
+                return true
+              })
+              .slice(0, summaryCap)
+              .map(hit => ({
+                ...hit,
+                scope: scopeForRange(hit.startId, hit.endId, compactedThroughId),
+              }))
+          }
+        }
+
+        let semanticMatches: Array<SemanticSearchHit & { scope: HistoryScope }> = []
         if ((modeUsed === 'semantic' || modeUsed === 'hybrid') && provider) {
           const semQuery = args.regex === true ? stripRegexMeta(query) : query.trim()
           if (semQuery.length > 0) {
             const topK = modeUsed === 'hybrid' ? Math.min(limit, 8) : limit
             const rawHits = await provider.semanticSearch(sessionId, semQuery, {
-              topK: topK + lexicalMatches.length,
+              topK: topK + lexicalMatches.length + summaryLexicalMatches.length,
               ...(args.fromId !== undefined ? { fromId: args.fromId } : {}),
               ...(args.toId !== undefined ? { toId: args.toId } : {}),
               signal: exec.signal,
             })
-            const lexIds = new Set(lexicalMatches.map(m => m.id))
             semanticMatches = rawHits
               .filter(hit => {
                 if (modeUsed !== 'hybrid') return true
                 for (const id of lexIds) {
                   if (id >= hit.startId && id <= hit.endId) return false
                 }
+                for (const s of summaryLexicalMatches) {
+                  if (overlapsRange(hit.startId, hit.endId, s.startId, s.endId)) return false
+                }
                 return true
               })
               .slice(0, topK)
+              .map(hit => ({
+                ...hit,
+                scope: scopeForRange(hit.startId, hit.endId, compactedThroughId),
+              }))
           }
         }
 
         return {
           modeUsed,
+          compactedThroughId,
           lexicalMatches,
+          summaryLexicalMatches,
           semanticMatches,
           totalLexicalMatches,
           hasMoreLexical: totalLexicalMatches > lexicalMatches.length,
@@ -289,7 +451,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
     defineTool({
       name: 'history_read',
       description:
-        'Read canonical event text from the current session by exact event id range (up to 20 events per call, bounded by maxChars with charOffset pagination). Use after `history_search` to inspect full context around a hit.',
+        'Read canonical history from the current session by exact event id range (tagged [compacted] or [in-context]). Supports `detail: "full"` (default, up to 20 events with full verbatim text) or `detail: "summary"` (up to 200 events, returning guard micro-card summaries when dsh-context-guard is active or head+tail truncated previews otherwise).',
       parameters: {
         fromId: {
           type: 'integer',
@@ -298,7 +460,13 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
         },
         toId: {
           type: 'integer',
-          description: `Optional inclusive ending event id (defaults to fromId; capped at ${MAX_READ_EVENTS} events per call).`,
+          description: `Optional inclusive ending event id (defaults to fromId; capped at ${MAX_READ_EVENTS_FULL} events in "full" mode or ${MAX_READ_EVENTS_SUMMARY} events in "summary" mode).`,
+        },
+        detail: {
+          type: 'string',
+          enum: ['full', 'summary'],
+          description:
+            'Level of detail: "full" (default, verbatim event text) or "summary" (compact timeline summaries for browsing a larger block of history).',
         },
         maxChars: {
           type: 'integer',
@@ -306,7 +474,7 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
         },
         charOffset: {
           type: 'integer',
-          description: 'Character offset into the formatted range for paginating long events. Defaults to 0.',
+          description: 'Character offset into the formatted range for paginating long outputs. Defaults to 0.',
         },
       },
       output: {
@@ -314,6 +482,9 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
           type: 'object',
           additionalProperties: false,
           properties: {
+            detailUsed: { type: 'string', enum: ['full', 'summary'], required: true },
+            summarySource: { type: 'string', enum: ['none', 'guard', 'truncated', 'mixed'], required: true },
+            compactedThroughId: { type: 'integer', required: true },
             content: { type: 'string', required: true },
             fromId: { type: 'integer', required: true },
             toId: { type: 'integer', required: true },
@@ -326,26 +497,45 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
           },
         },
         render: (_args, value) => {
+          const compactInfo = formatCompactedHeader(value.compactedThroughId)
+          const meta = value.detailUsed === 'summary'
+            ? `detail=summary, source=${value.summarySource}, ${compactInfo}, ${value.totalChars} chars`
+            : `detail=full, ${compactInfo}, ${value.totalChars} chars`
           const footer = value.truncated
             ? `\n\n[Truncated at ${value.nextCharOffset} / ${value.totalChars} chars; pass charOffset=${value.nextCharOffset} to continue.]`
             : ''
           return [{
             type: 'text',
-            text: `Events ${value.fromId}..${value.toId} (${value.totalChars} chars):\n\n${value.content}${footer}`,
+            text: `Events ${value.fromId}..${value.toId} (${meta}):\n\n${value.content}${footer}`,
           }]
         },
       },
       isConcurrencySafe: () => true,
       async execute(args, exec) {
         if (!exec.agent) throw new Error('history_read requires an owning agent session')
+        const detailUsed: 'full' | 'summary' = args.detail ?? 'full'
+        const maxEvents = detailUsed === 'summary' ? MAX_READ_EVENTS_SUMMARY : MAX_READ_EVENTS_FULL
         const maxChars = clamp(args.maxChars ?? DEFAULT_READ_CHARS, MIN_READ_CHARS, MAX_READ_CHARS)
         const charOffset = Math.max(args.charOffset ?? 0, 0)
 
         await deps.syncSession(exec.agent.session, exec.signal)
         const sessionId = exec.agent.session.id
-        const totalEvents = await deps.archives.getEventCount(sessionId)
+        const [totalEvents, compactedThroughId] = await Promise.all([
+          deps.archives.getEventCount(sessionId),
+          deps.archives.getCompactedThroughId(sessionId),
+        ])
         if (totalEvents <= 0) {
-          return { content: '', fromId: 0, toId: -1, totalChars: 0, truncated: false, nextCharOffset: null }
+          return {
+            detailUsed,
+            summarySource: 'none' as const,
+            compactedThroughId,
+            content: '',
+            fromId: 0,
+            toId: -1,
+            totalChars: 0,
+            truncated: false,
+            nextCharOffset: null,
+          }
         }
 
         const fromId = clamp(args.fromId, 0, totalEvents - 1)
@@ -353,18 +543,61 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
         if (requestedTo < fromId) {
           throw new Error(`toId (${requestedTo}) must be >= fromId (${fromId})`)
         }
-        const toId = clamp(Math.min(requestedTo, fromId + MAX_READ_EVENTS - 1), fromId, totalEvents - 1)
+        const toId = clamp(Math.min(requestedTo, fromId + maxEvents - 1), fromId, totalEvents - 1)
 
-        const rows = await deps.archives.readEventRange(sessionId, fromId, toId)
-        const full = rows
-          .map(row => `=== event ${row.id}: ${row.type} ===\n${row.text.length > 0 ? row.text : '(no text content)'}`)
-          .join('\n\n')
+        let full = ''
+        let summarySource: 'none' | 'guard' | 'truncated' | 'mixed' = 'none'
+
+        if (detailUsed === 'full') {
+          const rows = await deps.archives.readEventRange(sessionId, fromId, toId)
+          full = rows
+            .map(row => {
+              const scope = scopeForId(row.id, compactedThroughId)
+              return `=== event ${row.id} [${scope}]: ${row.type} ===\n${row.text.length > 0 ? row.text : '(no text content)'}`
+            })
+            .join('\n\n')
+        } else {
+          const provider = getGuardProvider(ctx)
+          if (provider?.listSummaries) {
+            const { throughEventId, cards } = await provider.listSummaries(sessionId, { fromId, toId })
+            if (throughEventId >= fromId) {
+              const parts: string[] = []
+              if (cards.length > 0) {
+                parts.push(cards.map(c => formatGuardSummaryCard(c, compactedThroughId)).join('\n'))
+              }
+              if (toId > throughEventId) {
+                const tailRows = await deps.archives.readEventRange(sessionId, throughEventId + 1, toId)
+                if (tailRows.length > 0) {
+                  parts.push(tailRows.map(r => formatTruncatedEvent(r, compactedThroughId)).join('\n\n'))
+                  summarySource = cards.length > 0 ? 'mixed' : 'truncated'
+                } else {
+                  summarySource = 'guard'
+                }
+              } else {
+                summarySource = 'guard'
+              }
+              full = parts.join('\n\n')
+            } else {
+              const rows = await deps.archives.readEventRange(sessionId, fromId, toId)
+              full = rows.map(r => formatTruncatedEvent(r, compactedThroughId)).join('\n\n')
+              summarySource = 'truncated'
+            }
+          } else {
+            const rows = await deps.archives.readEventRange(sessionId, fromId, toId)
+            full = rows.map(r => formatTruncatedEvent(r, compactedThroughId)).join('\n\n')
+            summarySource = 'truncated'
+          }
+        }
+
         const totalChars = full.length
         const slice = full.slice(charOffset, charOffset + maxChars)
         const endOffset = charOffset + slice.length
         const truncated = endOffset < totalChars
 
         return {
+          detailUsed,
+          summarySource,
+          compactedThroughId,
           content: slice,
           fromId,
           toId,
@@ -376,8 +609,8 @@ export function registerHistoryTools(ctx: Context, deps: HistoryToolsDeps): () =
       presentCall: args => ({
         card: 'generic',
         title: args.toId !== undefined && args.toId !== args.fromId
-          ? `Read history events ${args.fromId}..${args.toId}`
-          : `Read history event ${args.fromId}`,
+          ? `Read history events ${args.fromId}..${args.toId}${args.detail === 'summary' ? ' (summary)' : ''}`
+          : `Read history event ${args.fromId}${args.detail === 'summary' ? ' (summary)' : ''}`,
         kind: 'other',
         rawInput: args,
       }),

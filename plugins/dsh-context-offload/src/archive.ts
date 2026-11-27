@@ -558,6 +558,15 @@ export class ArchiveStore {
     })
   }
 
+  /** O(1) lookup of the highest compacted event id (`-1` if no compaction has occurred). */
+  async getCompactedThroughId(sessionId: string): Promise<number> {
+    return this.serial(sessionId, async () => {
+      const entry = await this.openDb(sessionId)
+      const row = entry.db.prepare('SELECT MAX(through_id) AS max_id FROM compact').get() as { max_id: number | null } | undefined
+      return row?.max_id ?? -1
+    })
+  }
+
   /** O(1) indexed range read directly from offload.sqlite. */
   async readEventRange(sessionId: string, fromId: number, toId: number): Promise<StoredEventRow[]> {
     return this.serial(sessionId, async () => {

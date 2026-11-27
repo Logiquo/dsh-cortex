@@ -1,0 +1,4 @@
+add:
+  - id: dsh-context-guard
+    plugin: dsh-context-guard
+    config: {}
