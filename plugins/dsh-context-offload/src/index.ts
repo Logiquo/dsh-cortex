@@ -41,8 +41,8 @@ function resolveRouteTarget(agent: Agent): { provider: string; model: string } |
 /**
  * Subclasses BasicCompactionEngine using its native dynamic contextWindow policy,
  * automatic pressure / model-switch / overflow handling, and transaction machinery.
- * Adds session-scoped canonical archiving, forward-looking execution briefs, and
- * built-in history search/read tools.
+ * Persists canonical session history into session-scoped SQLite (`offload.sqlite`),
+ * writes forward-looking execution briefs, and exposes history search/read tools.
  */
 export class ContextOffloadEngine extends BasicCompactionEngine {
   static override inject = inject
@@ -80,9 +80,13 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
       const timer = this.timers.get(session)
       if (timer) clearTimeout(timer)
       this.timers.delete(session)
+      this.archives.close(session.id)
     })
 
-    const disposeTools = registerHistoryTools(ctx)
+    const disposeTools = registerHistoryTools(ctx, {
+      archives: this.archives,
+      syncSession: (session, signal) => this.capture(session, signal),
+    })
 
     ctx.effect(() => async () => {
       this.stopping = true
@@ -92,30 +96,39 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
       this.timers.clear()
       await Promise.allSettled([...this.pending, ...sessions.map(session => this.capture(session))])
       await this.archives.drain()
+      this.archives.close()
     })
 
     for (const agent of ctx.agents.list()) schedule(agent.session)
 
     ctx.commands.register({
       name: 'context-offload',
-      description: 'Inspect, verify, or compact the context archive',
-      handler: async ({ agent, rawInput, signal, commandId }) => {
+      description: 'Inspect, verify, or rebuild the session context archive (offload.sqlite)',
+      handler: async ({ agent, rawInput, signal }) => {
         const action = rawInput.trim() || 'status'
         if (agent.session.header.origin === 'subagent') {
           return { kind: 'error', text: 'Context offload targets main-agent sessions.' }
         }
-        if (action === 'compact') {
-          const result = await this.compactNow(agent, signal, commandId)
-          return { kind: 'success', text: result ? `Compacted ${result.shadowedSeqs.length} history items.` : 'No compactable history.' }
+        if (action === 'rebuild') {
+          const cut = await this.rebuildSession(agent.session, signal)
+          return {
+            kind: 'success',
+            text: `Rebuilt offload.sqlite through event ${cut.throughId} (${cut.eventCount} events, ${cut.compactionCount} compact records).`,
+          }
         }
         if (action === 'verify') {
-          const catalog = await this.archives.verify(agent.session.id)
-          return { kind: 'success', text: catalog ? `Archive verified through event ${catalog.through} (${catalog.chunks.length} chunks).` : 'No archive yet.' }
+          const status = await this.archives.verify(agent.session.id)
+          return {
+            kind: 'success',
+            text: status
+              ? `Archive verified through event ${status.throughId} (${status.eventCount} events, ${status.compactionCount} compact records).`
+              : 'No archive yet.',
+          }
         }
         if (action !== 'status') {
-          return { kind: 'error', text: 'Usage: /context-offload [status|verify|compact]' }
+          return { kind: 'error', text: 'Usage: /context-offload [status|verify|rebuild]' }
         }
-        const catalog = await this.archives.verify(agent.session.id)
+        const status = await this.archives.verify(agent.session.id)
         const target = resolveRouteTarget(agent)
         let modelInfo: { contextWindow: number | null; defaultMaxTokens: number | null } = {
           contextWindow: null,
@@ -136,6 +149,7 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
           kind: 'success',
           text: JSON.stringify({
             root: this.archives.root,
+            dbPath: status?.dbPath ?? this.archives.dbPathFor(agent.session.id),
             provider: target?.provider ?? null,
             model: target?.model ?? null,
             contextWindow: modelInfo.contextWindow,
@@ -145,8 +159,9 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
             retainTokens: 'retainTokens' in this.config ? this.config.retainTokens : null,
             headroomTokens: this.config.headroomTokens,
             briefTargetTokens: briefTargetTokens(modelInfo.contextWindow ?? undefined),
-            archivedThrough: catalog?.through ?? -1,
-            chunks: catalog?.chunks.length ?? 0,
+            archivedThrough: status?.throughId ?? -1,
+            eventCount: status?.eventCount ?? 0,
+            compactions: status?.compactionCount ?? 0,
             error: this.failures.get(agent.session.id) ?? null,
           }, null, 2),
         }
@@ -154,16 +169,35 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
     })
   }
 
-  private async capture(session: Session, signal?: AbortSignal, verifyChunks = false) {
+  private async capture(session: Session, signal?: AbortSignal, verifyIntegrity = false) {
     try {
       const observation = await this.ctx.sessionQuery.observeSession(session.id, {
         projectionMode: 'none',
         ...(signal ? { signal } : {}),
       })
       try {
-        const cut = await this.archives.ensure(session.id, observation.events, signal, { verifyChunks })
+        const cut = await this.archives.ensure(session.id, observation.events, signal, { verifyIntegrity })
         this.failures.delete(session.id)
         return { ...cut, events: observation.events }
+      } finally {
+        observation[Symbol.dispose]()
+      }
+    } catch (error) {
+      this.failures.set(session.id, error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }
+
+  private async rebuildSession(session: Session, signal?: AbortSignal) {
+    try {
+      const observation = await this.ctx.sessionQuery.observeSession(session.id, {
+        projectionMode: 'none',
+        ...(signal ? { signal } : {}),
+      })
+      try {
+        const cut = await this.archives.rebuild(session.id, observation.events, signal)
+        this.failures.delete(session.id)
+        return cut
       } finally {
         observation[Symbol.dispose]()
       }
@@ -186,7 +220,7 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
   ): Promise<BriefResult> {
     if (agent.session.header.origin === 'subagent') return super.summarize(input, agent, signal)
 
-    // Full chunk integrity verification before committing any history replacement.
+    // Full SQLite integrity & hash-chain verification before committing any history replacement.
     const cut = await this.capture(agent.session, signal, true)
 
     const configuredTarget = this.config.summarizationProvider.length > 0 && this.config.summarizationModel.length > 0
@@ -244,7 +278,12 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
     validateBrief(body)
 
     const text = frameBrief(body, cut)
-    await this.archives.saveBrief(cut, text)
+    await this.archives.saveCompact(cut, {
+      provider: target.provider,
+      model: target.model,
+      body,
+      framedText: text,
+    })
 
     return {
       summary: [{ type: 'text' as const, text }],

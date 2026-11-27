@@ -1,17 +1,12 @@
 # dsh-context-offload
 
-Forward-looking compaction briefs, session-scoped history archives, and built-in
-history search/read tools for DeepSeek Harness (`>=0.2.2-rc.1 <0.3.0`).
+Forward-looking compaction briefs, session-scoped SQLite history archives (`offload.sqlite`), and built-in history search/read tools for DeepSeek Harness (`>=0.2.2-rc.1 <0.3.0`).
 
-The plugin subclasses `BasicCompactionEngine`, inheriting its dynamic
-model-`contextWindow` trigger policy, `toolResultPruner` pre-pruning,
-model-switch compaction, `context-overflow` recovery, manual `/compact`,
-tool-pairing balance, and checkpoint transaction format.
+The plugin subclasses `BasicCompactionEngine`, inheriting its dynamic model-`contextWindow` trigger policy, `toolResultPruner` pre-pruning, model-switch compaction, `context-overflow` recovery, manual `/compact`, tool-pairing balance, and checkpoint transaction format.
 
 ## Install
 
-Requires Node.js 24.9+ and the standard `dsh` composition (including session
-query, commands, and tools).
+Requires Node.js 24.9+ (uses built-in `node:sqlite`) and the standard `dsh` composition (including session query, commands, and tools).
 
 ```sh
 npm install
@@ -22,72 +17,49 @@ dsh --profile demo --dump-config
 dsh --profile demo
 ```
 
-The bundle disables the standard `compaction-basic` entry and mounts this
-backend. The host `/compact` command continues to work.
+The bundle disables the standard `compaction-basic` entry and mounts this backend. The host `/compact` command continues to work directly through this plugin.
 
 ## Configuration
 
-All compaction thresholds and retention ratios default directly to `dsh`'s
-`BasicCompactionEngine` policy (derived dynamically from each model's
-`contextWindow` via `ctx.llm.resolveModelInfo`). Standard
-`BasicCompactionConfig` options (such as `thresholdRatio`, `retainRatio`,
-`headroomTokens`, `modelPolicies`) may optionally be passed through.
+All compaction thresholds and retention ratios default directly to `dsh`'s `BasicCompactionEngine` policy (derived dynamically from each model's `contextWindow` via `ctx.llm.resolveModelInfo`). Standard `BasicCompactionConfig` options (such as `thresholdRatio`, `retainRatio`, `headroomTokens`, `modelPolicies`) may optionally be passed through.
 
 ```yaml
 - id: dsh-context-offload
   config:
-    # spill-root: optional absolute persistent directory (defaults to ~/.dsh/context-offload)
+    # storeRoot: optional absolute persistent directory (defaults to ~/.dsh/context-cortex)
     # thresholdRatio: 0.8
     # retainRatio: 0.16
 ```
 
-## Forward-looking execution briefs
+## SQLite archive storage (`offload.sqlite`)
 
-When compacting a main-agent session, `dsh-context-offload` archives the full
-canonical event log (with chunk integrity verification) and generates a
-forward-looking execution brief focused on:
+The default shared cortex root is `join(homedir(), '.dsh', 'context-cortex')`:
 
-1. **Task & Constraints** — governing request, active constraints, permissions, and latest user corrections.
-2. **Current State** — files modified/created, exact paths/symbols/values, unresolved failures, and observed vs. unverified status.
-3. **Dead Ends & Decisions** — ruled-out approaches and key decisions so the fresh instance avoids repeating failed work.
-4. **Next Action & Plan** — immediate next step, remaining steps in dependency order, and completion checks.
-5. **Archive Pointers** — optional search keywords for bulky offloaded details.
+```text
+<store-root>/session-<hash>/
+  offload.sqlite    # owned by dsh-context-offload (WAL mode)
+```
 
-Prior checkpoints are consolidated into a single fresh brief rather than nested.
-Reasoning blocks are excluded from the persisted brief.
+Tables inside `offload.sqlite`:
+- `meta`: `schema_version`, `session_id`, `through_id`, `chain_sha256`, `updated_at`.
+- `events`: `id INTEGER PRIMARY KEY` (1:1 with canonical `dsh` `event.seq`), `type`, `turn`, `step`, `time_ms`, `text`, `text_len`, `raw_json`, `sha256`.
+- `compact`: recorded compaction briefs (`id`, `compaction_id`, `through_id`, `turn`, `provider`, `model`, `body`, `framed_text`, `created_at`).
+
+When opened on an existing session that has not yet been indexed (or after `/context-offload rebuild`), `offload.sqlite` is built directly from `dsh`'s canonical session history (`sessionQuery.observeSession(..., { projectionMode: 'none' })`).
 
 ## Built-in history tools
 
-Once a main-agent session has been compacted (`replaceGeneration > 0`), two
-read-only, concurrency-safe tools activate automatically (consuming zero tool
-schema tokens prior to compaction):
+Once a main-agent session has been compacted (`replaceGeneration > 0`), two read-only, concurrency-safe tools activate automatically (consuming zero tool schema tokens prior to compaction):
 
-- `history_search`: keyword or regex search over the current session's full
-  canonical event log (newest-first by default, filterable by `eventTypes` and
-  `fromSeq`/`toSeq`, returning bounded snippets and event `seq`s).
-- `history_read`: read exact canonical event ranges (`fromSeq`..`toSeq`, up to
-  20 events per call) with `maxChars` and `charOffset` pagination.
-
-## Archive storage
-
-The default archive root is `join(homedir(), '.dsh', 'context-offload')`:
-
-```text
-<archive-root>/session-<hash>/
-  catalog.json
-  <random>-context-offload-c000001-turn000010-events000000-000150.txt
-  brief-<transaction-hash>.md
-```
-
-Background exports use an in-memory verified catalog cache and incremental
-hashing for low overhead; compaction commits and `/context-offload verify`
-perform full chunk checksum and hash-chain verification.
+- `history_search`: unified search over `offload.sqlite` (`mode`: `"hybrid"` default, `"lexical"`, or `"semantic"`). Runs streaming exact/regex search over `events` and, when `dsh-context-guard` is mounted (`ctx.contextGuard.semanticSearch`), automatically fuses non-overlapping semantic micro-card matches in the same call.
+- `history_read`: `O(1)` primary-key range read (`fromId`..`toId`, up to 20 events per call) with `maxChars` and `charOffset` pagination.
 
 ## Commands
 
-- `/compact` or `/context-offload compact`: manually compact an idle session.
-- `/context-offload status`: show resolved model `contextWindow`, active policy ratios, archive coverage, and latest export error.
-- `/context-offload verify`: verify catalog continuity and chunk checksums.
+- `/compact`: manually compact an idle session (handled natively by `dsh-context-offload`).
+- `/context-offload status`: show resolved model `contextWindow`, active policy ratios, `offload.sqlite` path, `archivedThrough`, `eventCount`, `compactions`, and latest export error.
+- `/context-offload verify`: verify SQLite integrity (`PRAGMA quick_check`), contiguous `events.id`, and full `sha256` hash-chain continuity.
+- `/context-offload rebuild`: rebuild the current session's `events` table from canonical `dsh` history.
 
 ## Validation
 
