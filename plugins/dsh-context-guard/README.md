@@ -2,7 +2,7 @@
 
 Local 0.8B context-degradation recorder, scorer, and semantic history search provider for DeepSeek Harness (`>=0.2.2-rc.1 <0.3.0`).
 
-> **Features**: records V2.4 chronological cards, distilled `0.8B` micro-cards, `embeddinggemma-2` vectors, and `0.8B-Judge` `p_degraded` scores into `guard.sqlite` (+ optional `timeline.txt`), powers hybrid lexical/semantic retrieval in `dsh-context-offload`, and appends zero-pronoun `<system-reminder>` notices persistently onto the latest root `tool` result via `tools/post-execute` when sustained degradation is detected (2 hits `>= 0.50` within 16 actions, with an 8-action cooldown after start, `/compact`, real user messages, and prior reminders; preserves `lastUserIndex` for 0 KV-Cache invalidation with `dsh-ephemeral-reasoning` and `dsh-ephemeral-reminder`). Does **not** trigger automatic compaction.
+> **Features**: records V2.4 chronological cards, distilled `0.8B` micro-cards, `embeddinggemma-2` vectors, and `0.8B-Judge` `p_degraded` scores into `guard.sqlite` (+ optional `timeline.txt`), powers hybrid lexical/semantic retrieval in `dsh-context-offload`, appends zero-pronoun `<system-reminder>` interventions persistently onto the latest root `tool` result via `tools/post-execute` when sustained degradation is detected (2 hits `>= 0.50` within 16 actions, with an 8-action cooldown after start, `/compact`, real user messages, and prior interventions; preserves `lastUserIndex` for 0 KV-Cache invalidation with `dsh-ephemeral-reasoning` and `dsh-ephemeral-reminder`), and escalates to a full-prefix mid-turn `ctx.compaction.compactRegion` (using `dsh-context-offload`'s custom execution brief when installed) if degradation persists after 2 reminders within the same tool-call chain.
 
 ## Zero-Config Local Runtime
 

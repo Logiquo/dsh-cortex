@@ -1,9 +1,12 @@
+import { toolPairingBalancedAfter, toolPairingBalancedBefore } from '@deepseek-ai/dsh-compaction'
+import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { StoredCard } from './cards.js'
 
 export const DEFAULT_DEGRADED_THRESHOLD = 0.5
 export const DEFAULT_HIT_WINDOW_STEPS = 16
 export const DEFAULT_HITS_TO_TRIGGER = 2
 export const DEFAULT_COOLDOWN_STEPS = 8
+export const DEFAULT_INTERVENTIONS_BEFORE_COMPACT = 2
 
 export interface InterventionPolicy {
   degradedThreshold: number
@@ -163,4 +166,28 @@ export function buildInterventionPrompt(
   )
 
   return lines.join('\n')
+}
+
+/**
+ * Select the full-prefix balanced surface span (all non-system nodes up to the latest
+ * tool-pairing-balanced boundary) for mid-turn `ctx.compaction.compactRegion`.
+ */
+export function selectFullPrefixCompactRange(session: Session): { start: SessionSeq; end: SessionSeq } | null {
+  const nodes = session.surface.nodes
+  if (nodes.length === 0) return null
+
+  const firstEvent = session.eventAt(nodes[0]!)
+  const startIdx = firstEvent?.type === 'system/message' ? 1 : 0
+  if (startIdx >= nodes.length) return null
+
+  const start = nodes[startIdx]!
+  if (!toolPairingBalancedBefore(session, start)) return null
+
+  for (let i = nodes.length - 1; i >= startIdx; i--) {
+    const candidateEnd = nodes[i]!
+    if (toolPairingBalancedAfter(session, candidateEnd)) {
+      return { start, end: candidateEnd }
+    }
+  }
+  return null
 }

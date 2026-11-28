@@ -58,6 +58,10 @@ export interface Config {
   hitsToTrigger?: number
   /** Quiet action-step cooldown after session start, /compact, a real user message, or an intervention. Defaults to 8. */
   cooldownSteps?: number
+  /** Escalate to full-prefix compaction via ctx.compaction.compactRegion after repeated interventions in one turn. Defaults to true. */
+  enableAutoCompact?: boolean
+  /** Number of reminders issued within a single tool-call chain before the next degradation hit triggers auto-compact. Defaults to 2. */
+  interventionsBeforeCompact?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -81,6 +85,8 @@ export const Config: z<Config> = z.object({
   hitWindowSteps: z.number(),
   hitsToTrigger: z.number(),
   cooldownSteps: z.number(),
+  enableAutoCompact: z.boolean(),
+  interventionsBeforeCompact: z.number(),
 })
 
 export function resolveStoreRoot(config: Config): string {

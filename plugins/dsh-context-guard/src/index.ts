@@ -1,6 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-agent'
+import type { CompactionEngine } from '@deepseek-ai/dsh-compaction'
 import type {} from '@deepseek-ai/dsh-session-query'
 import type {} from '@deepseek-ai/dsh-commands'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -17,15 +18,17 @@ import {
   resolveModelPath,
   resolveStoreRoot,
 } from './config.js'
-import { buildS3Window, extractCardsFromEvents } from './cards.js'
+import { buildS3Window, extractCardsFromEvents, isCompactionEvent } from './cards.js'
 import type { ExtractedCard, StoredCard } from './cards.js'
 import {
   DEFAULT_COOLDOWN_STEPS,
   DEFAULT_DEGRADED_THRESHOLD,
   DEFAULT_HIT_WINDOW_STEPS,
   DEFAULT_HITS_TO_TRIGGER,
+  DEFAULT_INTERVENTIONS_BEFORE_COMPACT,
   buildInterventionPrompt,
   evaluateIntervention,
+  selectFullPrefixCompactRange,
 } from './intervention.js'
 import type { InterventionEvaluation, InterventionPolicy } from './intervention.js'
 import { GuardStore } from './store.js'
@@ -47,6 +50,7 @@ export {
   buildS3Window,
   evaluateIntervention,
   buildInterventionPrompt,
+  selectFullPrefixCompactRange,
 }
 export type {
   GuardInferenceClient,
@@ -108,10 +112,15 @@ export class ContextGuardEngine implements ContextGuardApi {
   private readonly failures = new Map<string, string>()
   private readonly lastInterventionCardIdx = new Map<string, number>()
   private readonly pendingInterventions = new Map<string, { triggerCardIdx: number; text: string }>()
+  private readonly pendingCompactions = new Map<string, { triggerCardIdx: number }>()
   private readonly interventionCounts = new Map<string, number>()
+  private readonly turnInterventionCounts = new Map<string, number>()
+  private readonly autoCompactCounts = new Map<string, number>()
   private readonly shutdownController = new AbortController()
   private readonly debounceMs: number
   private readonly enableIntervention: boolean
+  private readonly enableAutoCompact: boolean
+  private readonly interventionsBeforeCompact: number
   private readonly interventionPolicy: InterventionPolicy
   private startupError: string | null = null
   private stopping = false
@@ -120,6 +129,8 @@ export class ContextGuardEngine implements ContextGuardApi {
     const storeRoot = resolveStoreRoot(config)
     this.debounceMs = config.debounceMs ?? 300
     this.enableIntervention = config.enableIntervention ?? true
+    this.enableAutoCompact = config.enableAutoCompact ?? true
+    this.interventionsBeforeCompact = Math.max(0, Math.floor(config.interventionsBeforeCompact ?? DEFAULT_INTERVENTIONS_BEFORE_COMPACT))
     this.interventionPolicy = {
       degradedThreshold: config.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD,
       hitWindowSteps: config.hitWindowSteps ?? DEFAULT_HIT_WINDOW_STEPS,
@@ -170,7 +181,12 @@ export class ContextGuardEngine implements ContextGuardApi {
     }
 
     ctx.on('session/created', schedule)
-    ctx.on('session/event', session => schedule(session))
+    ctx.on('session/event', (session, event) => {
+      if (event.type === 'turn/end' || isCompactionEvent(event)) {
+        this.resetTurnState(session.id)
+      }
+      schedule(session)
+    })
     ctx.on('session/flush', async session => {
       if (session.header.origin !== 'subagent') {
         await this.syncSession(session).catch(() => { /* recorded in failures map */ })
@@ -180,9 +196,10 @@ export class ContextGuardEngine implements ContextGuardApi {
       const timer = this.timers.get(session)
       if (timer) clearTimeout(timer)
       this.timers.delete(session)
-      this.pendingInterventions.delete(session.id)
+      this.resetTurnState(session.id)
       this.lastInterventionCardIdx.delete(session.id)
       this.interventionCounts.delete(session.id)
+      this.autoCompactCounts.delete(session.id)
       this.store.close(session.id)
     })
 
@@ -206,9 +223,7 @@ export class ContextGuardEngine implements ContextGuardApi {
           // Do not clobber another policy's structured value replacement; retry on next tool result.
           return downstream
         }
-        this.pendingInterventions.delete(sessionId)
-        this.lastInterventionCardIdx.set(sessionId, queued.triggerCardIdx)
-        this.interventionCounts.set(sessionId, (this.interventionCounts.get(sessionId) ?? 0) + 1)
+        this.recordReminderDelivered(sessionId, queued.triggerCardIdx)
         const baseContent = downstream.content ?? result.content
         return {
           ...downstream,
@@ -217,23 +232,48 @@ export class ContextGuardEngine implements ContextGuardApi {
         }
       }
 
-      this.pendingInterventions.delete(sessionId)
-      this.lastInterventionCardIdx.set(sessionId, queued.triggerCardIdx)
-      this.interventionCounts.set(sessionId, (this.interventionCounts.get(sessionId) ?? 0) + 1)
+      this.recordReminderDelivered(sessionId, queued.triggerCardIdx)
       return {
         ...downstream,
         feedback: [...downstream.feedback, reminderBlock],
       }
     })
 
-    // Pure reset hook: if a real user message enters, drop any stale pending intervention.
-    ctx.on('agent/pre-step', ({ agent, messages }, next) => {
+    // Reset turn state on real user input; otherwise execute queued full-prefix auto-compact
+    // mid-turn when a tool-call chain keeps degrading after `interventionsBeforeCompact` reminders.
+    ctx.on('agent/pre-step', async ({ agent, messages, signal }, next) => {
       const hasRealUserMsg = messages.some(m => {
         const src = m.source as { kind?: string; form?: unknown } | undefined
         return src?.kind === 'user' && src.form === undefined
       })
       if (hasRealUserMsg) {
-        this.pendingInterventions.delete(agent.session.id)
+        this.resetTurnState(agent.session.id)
+        return next()
+      }
+
+      if (!signal.aborted && this.enableIntervention && this.enableAutoCompact && agent.session.header.origin !== 'subagent') {
+        const queuedCompact = this.pendingCompactions.get(agent.session.id)
+        if (queuedCompact) {
+          this.pendingCompactions.delete(agent.session.id)
+          const compaction = this.getCompactionEngine()
+          if (compaction) {
+            const range = selectFullPrefixCompactRange(agent.session)
+            if (range) {
+              try {
+                await compaction.compactRegion(range.start, range.end, agent, signal)
+                this.resetTurnState(agent.session.id)
+                this.lastInterventionCardIdx.set(agent.session.id, queuedCompact.triggerCardIdx)
+                this.autoCompactCounts.set(agent.session.id, (this.autoCompactCounts.get(agent.session.id) ?? 0) + 1)
+              } catch (err) {
+                // Never abort the active turn if compaction fails; enter cooldown before retrying.
+                this.lastInterventionCardIdx.set(agent.session.id, queuedCompact.triggerCardIdx)
+                if (!signal.aborted) {
+                  this.failures.set(agent.session.id, `auto-compact failed: ${err instanceof Error ? err.message : String(err)}`)
+                }
+              }
+            }
+          }
+        }
       }
       return next()
     })
@@ -270,8 +310,13 @@ export class ContextGuardEngine implements ContextGuardApi {
               enabled: this.enableIntervention,
               policy: this.interventionPolicy,
               count: this.interventionCounts.get(agent.session.id) ?? 0,
+              turnCount: this.turnInterventionCounts.get(agent.session.id) ?? 0,
               lastInterventionCardIdx: this.lastInterventionCardIdx.get(agent.session.id) ?? null,
               pending: this.pendingInterventions.has(agent.session.id),
+              enableAutoCompact: this.enableAutoCompact,
+              interventionsBeforeCompact: this.interventionsBeforeCompact,
+              autoCompactCount: this.autoCompactCounts.get(agent.session.id) ?? 0,
+              pendingCompact: this.pendingCompactions.has(agent.session.id),
             },
             runtime: this.inference.status(),
             startupError: this.startupError,
@@ -371,20 +416,44 @@ export class ContextGuardEngine implements ContextGuardApi {
     }
   }
 
-  private hasHistoryTools(): boolean {
+  private getCompactionEngine(): CompactionEngine | undefined {
     const getter = (this.ctx as unknown as { get?: (name: string) => unknown }).get
-    return typeof getter === 'function' && getter.call(this.ctx, 'compaction') !== undefined
+    return typeof getter === 'function' ? (getter.call(this.ctx, 'compaction') as CompactionEngine | undefined) : undefined
+  }
+
+  private hasHistoryTools(): boolean {
+    return this.getCompactionEngine() !== undefined
+  }
+
+  private resetTurnState(sessionId: string): void {
+    this.turnInterventionCounts.delete(sessionId)
+    this.pendingInterventions.delete(sessionId)
+    this.pendingCompactions.delete(sessionId)
+  }
+
+  private recordReminderDelivered(sessionId: string, triggerCardIdx: number): void {
+    this.pendingInterventions.delete(sessionId)
+    this.lastInterventionCardIdx.set(sessionId, triggerCardIdx)
+    this.interventionCounts.set(sessionId, (this.interventionCounts.get(sessionId) ?? 0) + 1)
+    this.turnInterventionCounts.set(sessionId, (this.turnInterventionCounts.get(sessionId) ?? 0) + 1)
   }
 
   private updatePendingIntervention(sessionId: string, cards: readonly StoredCard[]): void {
     const lastIdx = this.lastInterventionCardIdx.get(sessionId) ?? -1
     const ev = evaluateIntervention(cards, lastIdx, this.interventionPolicy)
     if (ev.shouldIntervene && ev.triggerCardIdx !== null) {
-      const text = buildInterventionPrompt(cards, { hasHistoryTools: this.hasHistoryTools() })
-      this.pendingInterventions.set(sessionId, { triggerCardIdx: ev.triggerCardIdx, text })
+      const turnCount = this.turnInterventionCounts.get(sessionId) ?? 0
+      if (this.enableAutoCompact && turnCount >= this.interventionsBeforeCompact && this.getCompactionEngine() !== undefined) {
+        this.pendingInterventions.delete(sessionId)
+        this.pendingCompactions.set(sessionId, { triggerCardIdx: ev.triggerCardIdx })
+      } else {
+        const text = buildInterventionPrompt(cards, { hasHistoryTools: this.hasHistoryTools() })
+        this.pendingInterventions.set(sessionId, { triggerCardIdx: ev.triggerCardIdx, text })
+      }
     } else if (ev.actionsSinceReset <= this.interventionPolicy.cooldownSteps) {
-      // A reset boundary (new user message / compact) occurred; clear any stale queued intervention.
+      // A reset boundary (new user message / compact) occurred; clear any stale queued intervention/compaction.
       this.pendingInterventions.delete(sessionId)
+      this.pendingCompactions.delete(sessionId)
     }
   }
 

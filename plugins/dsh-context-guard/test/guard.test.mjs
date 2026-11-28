@@ -433,3 +433,96 @@ test('tools/post-execute appends checkpoint reminder onto tool result without cr
   assert.equal(lastAction.resText, 'still mismatching')
   assert.doesNotMatch(lastAction.resText, /<system-reminder>/)
 })
+
+test('escalates to full-prefix compactRegion on 3rd degradation hit after 2 reminders in one turn and continues turn', async t => {
+  const { ctx, session, agent, commands, guard } = await fixture(t, {
+    cooldownSteps: 1,
+    hitsToTrigger: 2,
+    hitWindowSteps: 16,
+    enableAutoCompact: true,
+    interventionsBeforeCompact: 2,
+  })
+
+  const compactCalls = []
+  ctx.provide('compaction', {
+    async compactRegion(start, end, targetAgent) {
+      compactCalls.push({ start, end, sessionId: targetAgent.session.id })
+      return { shadowedRange: { start, end }, shadowedSeqs: [], shadowedTokenCount: 100 }
+    },
+  })
+
+  // Leading system/message (must be skipped by full-prefix compact range) + real user message
+  session.append('system/message', { id: 'sys0', role: 'system', content: [{ type: 'text', text: 'System prompt' }], source: { kind: 'system-prompt' } }, { surfaceOp: 'append' })
+  const userEv = session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'Investigate SOFA mismatch.' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+
+  let stepNum = 0
+  const addAction = () => {
+    stepNum++
+    const callId = `c${stepNum}`
+    session.append('assistant/message', {
+      turn: 1, step: stepNum, stream: [],
+      message: createAssistantMessage({
+        source: { provider: 'p', model: 'm' },
+        content: [{ type: 'tool-call', id: callId, name: 'run_code', arguments: '{"cmd":"python sofa.py"}' }],
+      }),
+    }, { surfaceOp: 'append' })
+    session.append('tool/call', { turn: 1, step: stepNum, callId, name: 'run_code', arguments: '{"cmd":"python sofa.py"}' })
+    return session.append('tool/result', {
+      turn: 1, step: stepNum,
+      message: { id: `tr${stepNum}`, role: 'tool', toolCallId: callId, source: { kind: 'tool', callId }, content: [{ type: 'text', text: 'SOFA mismatch!' }] },
+    }, { surfaceOp: 'append' })
+  }
+
+  const runPostExecute = async () => ctx.waterfall(
+    'tools/post-execute',
+    { name: 'run_code', arguments: {}, agent, callId: `c${stepNum}`, rootCallId: `c${stepNum}`, signal: new AbortController().signal },
+    { isError: false, value: 'ok', content: [{ type: 'text', text: 'SOFA mismatch!' }] },
+    async () => ({ kind: 'accept' }),
+  )
+
+  const runPreStep = async () => ctx.waterfall(
+    'agent/pre-step',
+    { agent, messages: [], turn: 1, step: stepNum + 1, signal: new AbortController().signal, modelSelection: { provider: 'p', model: 'm' } },
+    async () => ({ kind: 'enter', messages: [] }),
+  )
+
+  // Hit #1 (3 actions -> 2 hits, > 1 cooldown) => Reminder #1
+  addAction(); addAction(); addAction()
+  await guard.syncSession(session)
+  const d1 = await runPostExecute()
+  assert.equal(d1.content.length, 2)
+  assert.match(d1.content[1].text, /<system-reminder>/)
+  assert.equal(compactCalls.length, 0)
+
+  // Hit #2 (2 more actions after cooldown=1) => Reminder #2
+  addAction(); addAction()
+  await guard.syncSession(session)
+  const d2 = await runPostExecute()
+  assert.equal(d2.content.length, 2)
+  assert.match(d2.content[1].text, /<system-reminder>/)
+  assert.equal(compactCalls.length, 0)
+
+  // Hit #3 (2 more actions after cooldown=1, already had 2 reminders in this turn) => Auto-Compact!
+  addAction()
+  const lastToolEv = addAction()
+  await guard.syncSession(session)
+
+  // Should NOT emit a 3rd reminder in tools/post-execute
+  const d3 = await runPostExecute()
+  assert.equal(d3.content, undefined)
+
+  // agent/pre-step executes compactRegion(userEv.seq .. lastToolEv.seq) and still enters next step!
+  const preDecision = await runPreStep()
+  assert.equal(preDecision.kind, 'enter')
+  assert.equal(compactCalls.length, 1)
+  assert.equal(compactCalls[0].start, userEv.seq)
+  assert.equal(compactCalls[0].end, lastToolEv.seq)
+
+  // Status reflects autoCompactCount=1 and reset turnCount=0
+  const statusCmd = await commands.get('context-guard').handler({ agent, rawInput: 'status', signal: new AbortController().signal })
+  const parsed = JSON.parse(statusCmd.text)
+  assert.equal(parsed.intervention.count, 2)
+  assert.equal(parsed.intervention.turnCount, 0)
+  assert.equal(parsed.intervention.autoCompactCount, 1)
+  assert.equal(parsed.intervention.pendingCompact, false)
+})
