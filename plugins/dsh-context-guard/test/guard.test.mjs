@@ -14,8 +14,8 @@ import {
   LlamaGuardRuntime,
   extractCardsFromEvents,
   buildS3Window,
-  evaluateNudge,
-  buildCheckpointPrompt,
+  evaluateIntervention,
+  buildInterventionPrompt,
 } from '../lib/index.js'
 import {
   DEFAULT_EMB_MODEL,
@@ -315,7 +315,7 @@ test('LlamaGuardRuntime.ensureReady checks runtime and auto-downloads missing mo
   await assert.rejects(() => noDl.ensureReady(), /autoDownloadModels is disabled/)
 })
 
-test('evaluateNudge enforces 8-step cooldown after start/compact/user/nudge and triggers on 2 hits in 16 steps', () => {
+test('evaluateIntervention enforces 8-step cooldown after start/compact/user/intervention and triggers on 2 hits in 16 steps', () => {
   const policy = { degradedThreshold: 0.5, hitWindowSteps: 16, hitsToTrigger: 2, cooldownSteps: 8 }
   const makeAction = (idx, p, compactBefore = false) => ({
     cardIdx: idx,
@@ -349,35 +349,35 @@ test('evaluateNudge enforces 8-step cooldown after start/compact/user/nudge and 
   // 1. Cooldown after user message: 8 high-score actions right after user must NOT trigger
   const cards = [makeUser(0)]
   for (let i = 1; i <= 8; i++) cards.push(makeAction(i, 0.7))
-  assert.equal(evaluateNudge(cards, -1, policy).shouldNudge, false)
+  assert.equal(evaluateIntervention(cards, -1, policy).shouldIntervene, false)
 
   // 2. 9th action with p >= 0.50: window has >= 2 hits and cooldown elapsed -> triggers!
   cards.push(makeAction(9, 0.55))
-  const ev1 = evaluateNudge(cards, -1, policy)
-  assert.equal(ev1.shouldNudge, true)
+  const ev1 = evaluateIntervention(cards, -1, policy)
+  assert.equal(ev1.shouldIntervene, true)
   assert.equal(ev1.triggerCardIdx, 9)
 
-  // 3. After recording nudge at cardIdx=9, next 8 actions must stay silent (cooldown)
+  // 3. After recording intervention at cardIdx=9, next 8 actions must stay silent (cooldown)
   for (let i = 10; i <= 17; i++) cards.push(makeAction(i, 0.65))
-  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, false)
+  assert.equal(evaluateIntervention(cards, 9, policy).shouldIntervene, false)
 
-  // 4. 9th action after nudge (cardIdx=18) with p < 0.50 must NOT trigger (current step not a hit)
+  // 4. 9th action after intervention (cardIdx=18) with p < 0.50 must NOT trigger (current step not a hit)
   cards.push(makeAction(18, 0.30))
-  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, false)
+  assert.equal(evaluateIntervention(cards, 9, policy).shouldIntervene, false)
 
-  // 5. 10th action after nudge (cardIdx=19) with p >= 0.50 -> triggers again
+  // 5. 10th action after intervention (cardIdx=19) with p >= 0.50 -> triggers again
   cards.push(makeAction(19, 0.52))
-  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, true)
+  assert.equal(evaluateIntervention(cards, 9, policy).shouldIntervene, true)
 
   // 6. Compaction resets cooldown for 8 actions
   cards.push(makeAction(20, 0.70, true))
   for (let i = 21; i <= 27; i++) cards.push(makeAction(i, 0.70))
-  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, false)
+  assert.equal(evaluateIntervention(cards, 9, policy).shouldIntervene, false)
   cards.push(makeAction(28, 0.70))
-  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, true)
+  assert.equal(evaluateIntervention(cards, 9, policy).shouldIntervene, true)
 
-  // 7. Checkpoint prompt is zero-pronoun and includes active constraints + observed actions
-  const prompt = buildCheckpointPrompt(cards, { hasHistoryTools: true })
+  // 7. Intervention prompt is zero-pronoun and includes active constraints + observed actions
+  const prompt = buildInterventionPrompt(cards, { hasHistoryTools: true })
   assert.match(prompt, /<system-reminder>/)
   assert.match(prompt, /<\/system-reminder>/)
   assert.doesNotMatch(prompt, /level=/)

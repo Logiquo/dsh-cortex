@@ -24,10 +24,10 @@ import {
   DEFAULT_DEGRADED_THRESHOLD,
   DEFAULT_HIT_WINDOW_STEPS,
   DEFAULT_HITS_TO_TRIGGER,
-  buildCheckpointPrompt,
-  evaluateNudge,
-} from './nudge.js'
-import type { NudgeEvaluation, NudgePolicy } from './nudge.js'
+  buildInterventionPrompt,
+  evaluateIntervention,
+} from './intervention.js'
+import type { InterventionEvaluation, InterventionPolicy } from './intervention.js'
 import { GuardStore } from './store.js'
 import type {
   GuardSessionStatus,
@@ -45,8 +45,8 @@ export {
   LlamaGuardRuntime,
   extractCardsFromEvents,
   buildS3Window,
-  evaluateNudge,
-  buildCheckpointPrompt,
+  evaluateIntervention,
+  buildInterventionPrompt,
 }
 export type {
   GuardInferenceClient,
@@ -57,8 +57,8 @@ export type {
   SummaryRangeResult,
   ExtractedCard,
   StoredCard,
-  NudgePolicy,
-  NudgeEvaluation,
+  InterventionPolicy,
+  InterventionEvaluation,
 }
 
 export const name = 'dsh-context-guard'
@@ -106,21 +106,21 @@ export class ContextGuardEngine implements ContextGuardApi {
   private readonly timers = new Map<Session, ReturnType<typeof setTimeout>>()
   private readonly pending = new Set<Promise<unknown>>()
   private readonly failures = new Map<string, string>()
-  private readonly lastNudgeCardIdx = new Map<string, number>()
-  private readonly pendingNudges = new Map<string, { triggerCardIdx: number; text: string }>()
-  private readonly nudgeCounts = new Map<string, number>()
+  private readonly lastInterventionCardIdx = new Map<string, number>()
+  private readonly pendingInterventions = new Map<string, { triggerCardIdx: number; text: string }>()
+  private readonly interventionCounts = new Map<string, number>()
   private readonly shutdownController = new AbortController()
   private readonly debounceMs: number
-  private readonly enableNudge: boolean
-  private readonly nudgePolicy: NudgePolicy
+  private readonly enableIntervention: boolean
+  private readonly interventionPolicy: InterventionPolicy
   private startupError: string | null = null
   private stopping = false
 
   constructor(private readonly ctx: Context, config: Config = {}, opts: GuardServiceOptions = {}) {
     const storeRoot = resolveStoreRoot(config)
     this.debounceMs = config.debounceMs ?? 300
-    this.enableNudge = config.enableNudge ?? true
-    this.nudgePolicy = {
+    this.enableIntervention = config.enableIntervention ?? true
+    this.interventionPolicy = {
       degradedThreshold: config.degradedThreshold ?? DEFAULT_DEGRADED_THRESHOLD,
       hitWindowSteps: config.hitWindowSteps ?? DEFAULT_HIT_WINDOW_STEPS,
       hitsToTrigger: config.hitsToTrigger ?? DEFAULT_HITS_TO_TRIGGER,
@@ -180,24 +180,24 @@ export class ContextGuardEngine implements ContextGuardApi {
       const timer = this.timers.get(session)
       if (timer) clearTimeout(timer)
       this.timers.delete(session)
-      this.pendingNudges.delete(session.id)
-      this.lastNudgeCardIdx.delete(session.id)
-      this.nudgeCounts.delete(session.id)
+      this.pendingInterventions.delete(session.id)
+      this.lastInterventionCardIdx.delete(session.id)
+      this.interventionCounts.delete(session.id)
       this.store.close(session.id)
     })
 
-    // Mid-tool-chain checkpoint delivery via tools/post-execute:
+    // Mid-tool-chain intervention delivery via tools/post-execute:
     // Appends `<system-reminder>` persistently onto the latest root `role: 'tool'` result content
     // instead of injecting a new `role: 'user'` message, preserving `lastUserIndex` so
     // `dsh-ephemeral-reasoning` never strips mid-chain reasoning and `dsh-ephemeral-reminder`
     // never shifts mid-turn (0 KV-Cache invalidation).
     ctx.on('tools/post-execute', async (exec, result, next): Promise<PostToolDecision> => {
       const downstream = await next()
-      if (!this.enableNudge || !exec.agent || exec.parent !== undefined) return downstream
+      if (!this.enableIntervention || !exec.agent || exec.parent !== undefined) return downstream
       if (exec.agent.session.header.origin === 'subagent') return downstream
 
       const sessionId = exec.agent.session.id
-      const queued = this.pendingNudges.get(sessionId)
+      const queued = this.pendingInterventions.get(sessionId)
       if (!queued) return downstream
 
       const reminderBlock: ContentBlock = { type: 'text', text: `\n${queued.text}` }
@@ -206,9 +206,9 @@ export class ContextGuardEngine implements ContextGuardApi {
           // Do not clobber another policy's structured value replacement; retry on next tool result.
           return downstream
         }
-        this.pendingNudges.delete(sessionId)
-        this.lastNudgeCardIdx.set(sessionId, queued.triggerCardIdx)
-        this.nudgeCounts.set(sessionId, (this.nudgeCounts.get(sessionId) ?? 0) + 1)
+        this.pendingInterventions.delete(sessionId)
+        this.lastInterventionCardIdx.set(sessionId, queued.triggerCardIdx)
+        this.interventionCounts.set(sessionId, (this.interventionCounts.get(sessionId) ?? 0) + 1)
         const baseContent = downstream.content ?? result.content
         return {
           ...downstream,
@@ -217,23 +217,23 @@ export class ContextGuardEngine implements ContextGuardApi {
         }
       }
 
-      this.pendingNudges.delete(sessionId)
-      this.lastNudgeCardIdx.set(sessionId, queued.triggerCardIdx)
-      this.nudgeCounts.set(sessionId, (this.nudgeCounts.get(sessionId) ?? 0) + 1)
+      this.pendingInterventions.delete(sessionId)
+      this.lastInterventionCardIdx.set(sessionId, queued.triggerCardIdx)
+      this.interventionCounts.set(sessionId, (this.interventionCounts.get(sessionId) ?? 0) + 1)
       return {
         ...downstream,
         feedback: [...downstream.feedback, reminderBlock],
       }
     })
 
-    // Pure reset hook: if a real user message enters, drop any stale pending checkpoint.
+    // Pure reset hook: if a real user message enters, drop any stale pending intervention.
     ctx.on('agent/pre-step', ({ agent, messages }, next) => {
       const hasRealUserMsg = messages.some(m => {
         const src = m.source as { kind?: string; form?: unknown } | undefined
         return src?.kind === 'user' && src.form === undefined
       })
       if (hasRealUserMsg) {
-        this.pendingNudges.delete(agent.session.id)
+        this.pendingInterventions.delete(agent.session.id)
       }
       return next()
     })
@@ -266,12 +266,12 @@ export class ContextGuardEngine implements ContextGuardApi {
           kind: 'success',
           text: JSON.stringify({
             ...st,
-            nudge: {
-              enabled: this.enableNudge,
-              policy: this.nudgePolicy,
-              count: this.nudgeCounts.get(agent.session.id) ?? 0,
-              lastNudgeCardIdx: this.lastNudgeCardIdx.get(agent.session.id) ?? null,
-              pending: this.pendingNudges.has(agent.session.id),
+            intervention: {
+              enabled: this.enableIntervention,
+              policy: this.interventionPolicy,
+              count: this.interventionCounts.get(agent.session.id) ?? 0,
+              lastInterventionCardIdx: this.lastInterventionCardIdx.get(agent.session.id) ?? null,
+              pending: this.pendingInterventions.has(agent.session.id),
             },
             runtime: this.inference.status(),
             startupError: this.startupError,
@@ -360,8 +360,8 @@ export class ContextGuardEngine implements ContextGuardApi {
 
       const replaceAll = forceRebuild || reuseLen < prev.cards.length
       await this.store.saveCards(session.id, throughEventId, working, replaceAll)
-      if (this.enableNudge && !forceRebuild) {
-        this.updatePendingNudge(session.id, working)
+      if (this.enableIntervention && !forceRebuild) {
+        this.updatePendingIntervention(session.id, working)
       }
       this.failures.delete(session.id)
       return this.store.getStatus(session.id)
@@ -376,15 +376,15 @@ export class ContextGuardEngine implements ContextGuardApi {
     return typeof getter === 'function' && getter.call(this.ctx, 'compaction') !== undefined
   }
 
-  private updatePendingNudge(sessionId: string, cards: readonly StoredCard[]): void {
-    const lastIdx = this.lastNudgeCardIdx.get(sessionId) ?? -1
-    const ev = evaluateNudge(cards, lastIdx, this.nudgePolicy)
-    if (ev.shouldNudge && ev.triggerCardIdx !== null) {
-      const text = buildCheckpointPrompt(cards, { hasHistoryTools: this.hasHistoryTools() })
-      this.pendingNudges.set(sessionId, { triggerCardIdx: ev.triggerCardIdx, text })
-    } else if (ev.actionsSinceReset <= this.nudgePolicy.cooldownSteps) {
-      // A reset boundary (new user message / compact) occurred; clear any stale queued checkpoint.
-      this.pendingNudges.delete(sessionId)
+  private updatePendingIntervention(sessionId: string, cards: readonly StoredCard[]): void {
+    const lastIdx = this.lastInterventionCardIdx.get(sessionId) ?? -1
+    const ev = evaluateIntervention(cards, lastIdx, this.interventionPolicy)
+    if (ev.shouldIntervene && ev.triggerCardIdx !== null) {
+      const text = buildInterventionPrompt(cards, { hasHistoryTools: this.hasHistoryTools() })
+      this.pendingInterventions.set(sessionId, { triggerCardIdx: ev.triggerCardIdx, text })
+    } else if (ev.actionsSinceReset <= this.interventionPolicy.cooldownSteps) {
+      // A reset boundary (new user message / compact) occurred; clear any stale queued intervention.
+      this.pendingInterventions.delete(sessionId)
     }
   }
 

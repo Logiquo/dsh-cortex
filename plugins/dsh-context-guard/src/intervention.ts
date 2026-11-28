@@ -5,15 +5,15 @@ export const DEFAULT_HIT_WINDOW_STEPS = 16
 export const DEFAULT_HITS_TO_TRIGGER = 2
 export const DEFAULT_COOLDOWN_STEPS = 8
 
-export interface NudgePolicy {
+export interface InterventionPolicy {
   degradedThreshold: number
   hitWindowSteps: number
   hitsToTrigger: number
   cooldownSteps: number
 }
 
-export interface NudgeEvaluation {
-  shouldNudge: boolean
+export interface InterventionEvaluation {
+  shouldIntervene: boolean
   triggerCardIdx: number | null
   currentScore: number | null
   windowHits: number
@@ -21,20 +21,20 @@ export interface NudgeEvaluation {
 }
 
 /**
- * Evaluate whether the current session timeline should trigger a context-guard checkpoint.
+ * Evaluate whether the current session timeline should trigger a context-guard intervention.
  *
  * All step counts are measured in `[ACTION]` cards (`tool/call + tool/result` pairs).
  * Reset boundaries (each enforcing `cooldownSteps` quiet actions and clearing the hit window):
  *   1. Session start
  *   2. Most recent `/compact` (`compactBefore === true`)
  *   3. Most recent real `[USER]` message (`kind === 'constraint'`)
- *   4. Most recent injected checkpoint (`lastNudgeCardIdx`)
+ *   4. Most recent injected intervention (`lastInterventionCardIdx`)
  */
-export function evaluateNudge(
+export function evaluateIntervention(
   cards: readonly StoredCard[],
-  lastNudgeCardIdx: number,
-  policy: NudgePolicy,
-): NudgeEvaluation {
+  lastInterventionCardIdx: number,
+  policy: InterventionPolicy,
+): InterventionEvaluation {
   // Find the most recent scored action card.
   let latestActionPos = -1
   for (let i = cards.length - 1; i >= 0; i--) {
@@ -45,18 +45,18 @@ export function evaluateNudge(
     }
   }
   if (latestActionPos === -1) {
-    return { shouldNudge: false, triggerCardIdx: null, currentScore: null, windowHits: 0, actionsSinceReset: 0 }
+    return { shouldIntervene: false, triggerCardIdx: null, currentScore: null, windowHits: 0, actionsSinceReset: 0 }
   }
 
   const latestAction = cards[latestActionPos]!
   const currentScore = latestAction.pDegraded!
 
   // Find the latest reset boundary at or before latestActionPos.
-  // Actions strictly after resetStartIdx belong to the current active window.
+  // Actions strictly after resetBoundaryPos belong to the current active window.
   let resetBoundaryPos = -1
   for (let i = latestActionPos; i >= 0; i--) {
     const c = cards[i]!
-    if (c.cardIdx <= lastNudgeCardIdx) {
+    if (c.cardIdx <= lastInterventionCardIdx) {
       resetBoundaryPos = i
       break
     }
@@ -81,7 +81,7 @@ export function evaluateNudge(
   const actionsSinceReset = actionsAfterReset.length
   if (actionsSinceReset <= policy.cooldownSteps) {
     return {
-      shouldNudge: false,
+      shouldIntervene: false,
       triggerCardIdx: null,
       currentScore,
       windowHits: 0,
@@ -97,10 +97,10 @@ export function evaluateNudge(
     }
   }
 
-  const shouldNudge = currentScore >= policy.degradedThreshold && windowHits >= policy.hitsToTrigger
+  const shouldIntervene = currentScore >= policy.degradedThreshold && windowHits >= policy.hitsToTrigger
   return {
-    shouldNudge,
-    triggerCardIdx: shouldNudge ? latestAction.cardIdx : null,
+    shouldIntervene,
+    triggerCardIdx: shouldIntervene ? latestAction.cardIdx : null,
     currentScore,
     windowHits,
     actionsSinceReset,
@@ -113,10 +113,10 @@ function clipOneLine(text: string, maxChars: number): string {
 }
 
 /**
- * Render the zero-pronoun, structural meta-instruction checkpoint injected before the next step.
+ * Render the zero-pronoun, structural meta-instruction intervention reminder.
  * Uses externalized recent-action trace + active user constraints + evidence-conditioned decision gate.
  */
-export function buildCheckpointPrompt(
+export function buildInterventionPrompt(
   cards: readonly StoredCard[],
   options: { hasHistoryTools?: boolean } = {},
 ): string {
