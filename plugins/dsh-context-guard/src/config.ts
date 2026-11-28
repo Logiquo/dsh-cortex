@@ -48,6 +48,16 @@ export interface Config {
   writeTimelineTxt?: boolean
   /** Background debounce interval in ms. Defaults to 300. */
   debounceMs?: number
+  /** Enable mid-tool-chain context-guard checkpoint injection. Defaults to true. */
+  enableNudge?: boolean
+  /** Per-action p_degraded threshold counted as one hit. Defaults to 0.50. */
+  degradedThreshold?: number
+  /** Sliding window of recent action steps for counting hits. Defaults to 16. */
+  hitWindowSteps?: number
+  /** Number of hits in the window (with current action hitting) required to trigger a checkpoint. Defaults to 2. */
+  hitsToTrigger?: number
+  /** Quiet action-step cooldown after session start, /compact, a real user message, or a checkpoint. Defaults to 8. */
+  cooldownSteps?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -66,6 +76,11 @@ export const Config: z<Config> = z.object({
   embeddingModel: z.string(),
   writeTimelineTxt: z.boolean(),
   debounceMs: z.number(),
+  enableNudge: z.boolean(),
+  degradedThreshold: z.number(),
+  hitWindowSteps: z.number(),
+  hitsToTrigger: z.number(),
+  cooldownSteps: z.number(),
 })
 
 export function resolveStoreRoot(config: Config): string {

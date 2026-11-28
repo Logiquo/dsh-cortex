@@ -14,6 +14,8 @@ import {
   LlamaGuardRuntime,
   extractCardsFromEvents,
   buildS3Window,
+  evaluateNudge,
+  buildCheckpointPrompt,
 } from '../lib/index.js'
 import {
   DEFAULT_EMB_MODEL,
@@ -311,4 +313,123 @@ test('LlamaGuardRuntime.ensureReady checks runtime and auto-downloads missing mo
     embeddingModelPath: resolveModelPath(emptyRoot, undefined, DEFAULT_EMB_MODEL),
   })
   await assert.rejects(() => noDl.ensureReady(), /autoDownloadModels is disabled/)
+})
+
+test('evaluateNudge enforces 8-step cooldown after start/compact/user/nudge and triggers on 2 hits in 16 steps', () => {
+  const policy = { degradedThreshold: 0.5, hitWindowSteps: 16, hitsToTrigger: 2, cooldownSteps: 8 }
+  const makeAction = (idx, p, compactBefore = false) => ({
+    cardIdx: idx,
+    startEventId: idx * 2,
+    endEventId: idx * 2 + 1,
+    kind: 'action',
+    tool: 'run_code',
+    callText: 'cmd',
+    resText: 'out',
+    compactBefore,
+    micro: `#${idx} [run_code] cmd -> out`,
+    embedding: new Float32Array(4),
+    pDegraded: p,
+    createdAt: 0,
+  })
+  const makeUser = idx => ({
+    cardIdx: idx,
+    startEventId: idx * 2,
+    endEventId: idx * 2,
+    kind: 'constraint',
+    tool: '',
+    callText: 'Fix SOFA mismatch without dropping stays.',
+    resText: '',
+    compactBefore: false,
+    micro: `#${idx} [USER] Fix SOFA mismatch`,
+    embedding: new Float32Array(4),
+    pDegraded: null,
+    createdAt: 0,
+  })
+
+  // 1. Cooldown after user message: 8 high-score actions right after user must NOT trigger
+  const cards = [makeUser(0)]
+  for (let i = 1; i <= 8; i++) cards.push(makeAction(i, 0.7))
+  assert.equal(evaluateNudge(cards, -1, policy).shouldNudge, false)
+
+  // 2. 9th action with p >= 0.50: window has >= 2 hits and cooldown elapsed -> triggers!
+  cards.push(makeAction(9, 0.55))
+  const ev1 = evaluateNudge(cards, -1, policy)
+  assert.equal(ev1.shouldNudge, true)
+  assert.equal(ev1.triggerCardIdx, 9)
+
+  // 3. After recording nudge at cardIdx=9, next 8 actions must stay silent (cooldown)
+  for (let i = 10; i <= 17; i++) cards.push(makeAction(i, 0.65))
+  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, false)
+
+  // 4. 9th action after nudge (cardIdx=18) with p < 0.50 must NOT trigger (current step not a hit)
+  cards.push(makeAction(18, 0.30))
+  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, false)
+
+  // 5. 10th action after nudge (cardIdx=19) with p >= 0.50 -> triggers again
+  cards.push(makeAction(19, 0.52))
+  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, true)
+
+  // 6. Compaction resets cooldown for 8 actions
+  cards.push(makeAction(20, 0.70, true))
+  for (let i = 21; i <= 27; i++) cards.push(makeAction(i, 0.70))
+  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, false)
+  cards.push(makeAction(28, 0.70))
+  assert.equal(evaluateNudge(cards, 9, policy).shouldNudge, true)
+
+  // 7. Checkpoint prompt is zero-pronoun and includes active constraints + observed actions
+  const prompt = buildCheckpointPrompt(cards, { hasHistoryTools: true })
+  assert.match(prompt, /<system-reminder>/)
+  assert.match(prompt, /<\/system-reminder>/)
+  assert.doesNotMatch(prompt, /level=/)
+  assert.match(prompt, /Fix SOFA mismatch/)
+  assert.match(prompt, /Observed recent actions:/)
+  assert.match(prompt, /history_search/)
+  assert.doesNotMatch(prompt, /\b(you|your|yours|I|we|our)\b/i)
+})
+
+test('tools/post-execute appends checkpoint reminder onto tool result without creating a user message and cards.ts strips it', async t => {
+  const { ctx, session, agent, guard } = await fixture(t, { cooldownSteps: 1, hitsToTrigger: 2, hitWindowSteps: 16 })
+
+  session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'Investigate SOFA mismatch.' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+  // Append 3 actions; mock judge returns 0.72 for SOFA mismatch (cardIdx 2 & 3 -> 2 hits, > 1 cooldown)
+  for (let s = 1; s <= 3; s++) {
+    session.append('tool/call', { turn: 1, step: s, callId: `c${s}`, name: 'run_code', arguments: '{"cmd":"python sofa.py"}' })
+    session.append('tool/result', {
+      turn: 1, step: s,
+      message: { id: `tr${s}`, role: 'tool', toolCallId: `c${s}`, source: { kind: 'tool', callId: `c${s}` }, content: [{ type: 'text', text: 'SOFA mismatch!' }] },
+    }, { surfaceOp: 'append' })
+  }
+
+  await guard.syncSession(session)
+
+  // Simulate next root tool completion: tools/post-execute appends <system-reminder> onto result.content (no UserMessage!)
+  const toolResult = { isError: false, value: 'ok', content: [{ type: 'text', text: 'still mismatching' }] }
+  const postDecision = await ctx.waterfall(
+    'tools/post-execute',
+    { name: 'run_code', arguments: {}, agent, callId: 'c4', rootCallId: 'c4', signal: new AbortController().signal },
+    toolResult,
+    async () => ({ kind: 'accept' }),
+  )
+
+  assert.equal(postDecision.kind, 'accept')
+  assert.equal(postDecision.additionalContexts, undefined)
+  assert.equal(postDecision.content.length, 2)
+  assert.equal(postDecision.content[0].text, 'still mismatching')
+  assert.match(postDecision.content[1].text, /<system-reminder>/)
+  assert.match(postDecision.content[1].text, /<\/system-reminder>/)
+
+  // Persisting that enriched tool/result into session must NOT leak <system-reminder> into extracted card resText
+  session.append('tool/call', { turn: 1, step: 4, callId: 'c4', name: 'run_code', arguments: '{"cmd":"python sofa.py"}' })
+  session.append('tool/result', {
+    turn: 1, step: 4,
+    message: { id: 'tr4', role: 'tool', toolCallId: 'c4', source: { kind: 'tool', callId: 'c4' }, content: postDecision.content },
+  }, { surfaceOp: 'append' })
+  const obs = await ctx.sessionQuery.observeSession(session.id, { projectionMode: 'none' })
+  let evs
+  try { evs = [...obs.events] } finally { obs[Symbol.dispose]() }
+  const cards = extractCardsFromEvents(evs)
+  assert.equal(cards.filter(c => c.kind === 'constraint').length, 1)
+  const lastAction = cards[cards.length - 1]
+  assert.equal(lastAction.resText, 'still mismatching')
+  assert.doesNotMatch(lastAction.resText, /<system-reminder>/)
 })

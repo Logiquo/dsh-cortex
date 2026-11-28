@@ -43,6 +43,10 @@ export function headTailBytes(text: string, headChars: number, tailChars: number
   return `${text.slice(0, headChars)}\n...[skipped ${nBytes} bytes]...\n${text.slice(text.length - tailChars)}`
 }
 
+function stripSystemReminderBlocks(text: string): string {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+}
+
 function extractTextBlocks(content: unknown): string {
   if (typeof content === 'string') return content.trim()
   if (!Array.isArray(content)) return ''
@@ -216,7 +220,7 @@ export function extractCardsFromEvents(events: readonly SessionEvent[]): Extract
       } else {
         target = pendingQueue.find(c => !c.flushed && !c.resText)
       }
-      const resTxt = headTailBytes(extractTextBlocks(msg?.content), 12000, 12000)
+      const resTxt = headTailBytes(stripSystemReminderBlocks(extractTextBlocks(msg?.content)), 12000, 12000)
       if (target) {
         target.resText = target.resText ? `${target.resText}\n${resTxt}`.trim() : resTxt
         target.endEventId = seq
