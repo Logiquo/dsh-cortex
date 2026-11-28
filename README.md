@@ -1,3 +1,12 @@
+<p align="center">
+  <strong>English</strong> ·
+  <a href="docs/README.zh-CN.md">简体中文</a> ·
+  <a href="docs/README.zh-TW.md">正體中文</a> ·
+  <a href="docs/README.ja.md">日本語</a> ·
+  <a href="docs/README.fr.md">Français</a> ·
+  <a href="docs/README.es.md">Español</a>
+</p>
+
 # dsh-cortex
 
 A collection of DeepSeek Harness (`dsh`) plugins designed to improve `dsh`'s performance on software engineering (SWE) tasks through context offloading, local 0.8B degradation monitoring and intervention, outbound request transformation, reasoning cleanup, and ephemeral prompt reminders.
