@@ -103,68 +103,52 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
 
     ctx.commands.register({
       name: 'context-offload',
-      description: 'Inspect, verify, or rebuild the session context archive (offload.sqlite)',
+      description: 'Show session context archive and compaction status',
       handler: async ({ agent, rawInput, signal }) => {
-        const action = rawInput.trim() || 'status'
+        if (rawInput.trim().length > 0) {
+          return { kind: 'error', text: 'Usage: /context-offload (no arguments)' }
+        }
         if (agent.session.header.origin === 'subagent') {
           return { kind: 'error', text: 'Context offload targets main-agent sessions.' }
         }
-        if (action === 'rebuild') {
-          const cut = await this.rebuildSession(agent.session, signal)
-          return {
-            kind: 'success',
-            text: `Rebuilt offload.sqlite through event ${cut.throughId} (${cut.eventCount} events, ${cut.compactionCount} compact records).`,
-          }
-        }
-        if (action === 'verify') {
-          const status = await this.archives.verify(agent.session.id)
-          return {
-            kind: 'success',
-            text: status
-              ? `Archive verified through event ${status.throughId} (${status.eventCount} events, ${status.compactionCount} compact records).`
-              : 'No archive yet.',
-          }
-        }
-        if (action !== 'status') {
-          return { kind: 'error', text: 'Usage: /context-offload [status|verify|rebuild]' }
-        }
         const status = await this.archives.verify(agent.session.id)
         const target = resolveRouteTarget(agent)
-        let modelInfo: { contextWindow: number | null; defaultMaxTokens: number | null } = {
-          contextWindow: null,
-          defaultMaxTokens: null,
-        }
+        let contextWindow: number | null = null
         if (target) {
           try {
             const resolved = await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)
-            modelInfo = {
-              contextWindow: resolved.context?.contextWindow ?? null,
-              defaultMaxTokens: resolved.defaultMaxTokens ?? null,
-            }
+            contextWindow = resolved.context?.contextWindow ?? null
           } catch {
-            // Leave modelInfo null when the adapter cannot resolve the route yet.
+            // Leave contextWindow null when the adapter cannot resolve the route yet.
           }
         }
-        return {
-          kind: 'success',
-          text: JSON.stringify({
-            root: this.archives.root,
-            dbPath: status?.dbPath ?? this.archives.dbPathFor(agent.session.id),
-            provider: target?.provider ?? null,
-            model: target?.model ?? null,
-            contextWindow: modelInfo.contextWindow,
-            defaultMaxTokens: modelInfo.defaultMaxTokens,
-            thresholdRatio: this.config.thresholdRatio,
-            retainRatio: 'retainRatio' in this.config ? this.config.retainRatio : null,
-            retainTokens: 'retainTokens' in this.config ? this.config.retainTokens : null,
-            headroomTokens: this.config.headroomTokens,
-            briefTargetTokens: briefTargetTokens(modelInfo.contextWindow ?? undefined),
-            archivedThrough: status?.throughId ?? -1,
-            eventCount: status?.eventCount ?? 0,
-            compactions: status?.compactionCount ?? 0,
-            error: this.failures.get(agent.session.id) ?? null,
-          }, null, 2),
-        }
+        const thresholdPct = `${Math.round(this.config.thresholdRatio * 100)}%`
+        const retainDesc = 'retainRatio' in this.config && typeof this.config.retainRatio === 'number'
+          ? `${Math.round(this.config.retainRatio * 100)}%`
+          : ('retainTokens' in this.config && typeof this.config.retainTokens === 'number' ? `${this.config.retainTokens} tok` : 'default')
+        const windowShort = contextWindow ? `${Math.round(contextWindow / 1000)}k` : 'unknown window'
+        const archivePart = status
+          ? `archived ${status.eventCount} events (#${status.throughId}), ${status.compactionCount} compact`
+          : 'no archive yet'
+        const modelPart = target ? `${target.model} (${windowShort}, compact @ ${thresholdPct})` : `compact @ ${thresholdPct}`
+        const err = this.failures.get(agent.session.id) ?? null
+
+        const summary = [
+          archivePart,
+          modelPart,
+          ...(err ? [`error: ${err}`] : []),
+        ].join(' | ')
+
+        const lines = [
+          summary,
+          `archive: ${status ? `${status.eventCount} events (through #${status.throughId}), ${status.compactionCount} compact` : 'not initialized'}`,
+          `model: ${target ? `${target.provider}/${target.model}` : 'unresolved'} (window ${contextWindow ?? 'unknown'}, brief ~${briefTargetTokens(contextWindow ?? undefined)} tok)`,
+          `policy: threshold ${thresholdPct}, retain ${retainDesc}, headroom ${this.config.headroomTokens} tok`,
+          `db: ${status?.dbPath ?? this.archives.dbPathFor(agent.session.id)}`,
+        ]
+        if (err) lines.push(`error: ${err}`)
+
+        return { kind: 'success', text: lines.join('\n') }
       },
     })
   }
@@ -179,25 +163,6 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
         const cut = await this.archives.ensure(session.id, observation.events, signal, { verifyIntegrity })
         this.failures.delete(session.id)
         return { ...cut, events: observation.events }
-      } finally {
-        observation[Symbol.dispose]()
-      }
-    } catch (error) {
-      this.failures.set(session.id, error instanceof Error ? error.message : String(error))
-      throw error
-    }
-  }
-
-  private async rebuildSession(session: Session, signal?: AbortSignal) {
-    try {
-      const observation = await this.ctx.sessionQuery.observeSession(session.id, {
-        projectionMode: 'none',
-        ...(signal ? { signal } : {}),
-      })
-      try {
-        const cut = await this.archives.rebuild(session.id, observation.events, signal)
-        this.failures.delete(session.id)
-        return cut
       } finally {
         observation[Symbol.dispose]()
       }

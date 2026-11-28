@@ -45,7 +45,7 @@ Tables inside `offload.sqlite`:
 - `events`: `id INTEGER PRIMARY KEY` (1:1 with canonical `dsh` `event.seq`), `type`, `turn`, `step`, `time_ms`, `text`, `text_len`, `raw_json`, `sha256`.
 - `compact`: recorded compaction briefs (`id`, `compaction_id`, `through_id`, `turn`, `provider`, `model`, `body`, `framed_text`, `created_at`).
 
-When opened on an existing session that has not yet been indexed (or after `/context-offload rebuild`), `offload.sqlite` is built directly from `dsh`'s canonical session history (`sessionQuery.observeSession(..., { projectionMode: 'none' })`).
+When opened on an existing session that has not yet been indexed, `offload.sqlite` is built directly from `dsh`'s canonical session history (`sessionQuery.observeSession(..., { projectionMode: 'none' })`).
 
 ## Built-in history tools
 
@@ -57,9 +57,7 @@ On every main-agent session (from turn 1, covering both `[compacted]` and `[in-c
 ## Commands
 
 - `/compact`: manually compact an idle session (handled natively by `dsh-context-offload`).
-- `/context-offload status`: show resolved model `contextWindow`, active policy ratios, `offload.sqlite` path, `archivedThrough`, `eventCount`, `compactions`, and latest export error.
-- `/context-offload verify`: verify SQLite integrity (`PRAGMA quick_check`), contiguous `events.id`, and full `sha256` hash-chain continuity.
-- `/context-offload rebuild`: rebuild the current session's `events` table from canonical `dsh` history.
+- `/context-offload`: verify `offload.sqlite` integrity and show a concise summary of archived events, compactions, resolved model `contextWindow`, and active compaction policy.
 
 ## Validation
 

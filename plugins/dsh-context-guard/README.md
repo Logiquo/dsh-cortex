@@ -26,8 +26,7 @@ Requires Node.js 24.9+ (uses built-in `node:sqlite`). No manual `llama-server` o
 
 ## Commands
 
-- `/context-guard status`: show `guard.sqlite` coverage, card/scored counts, latest `p_degraded` scores, runtime status, and last error.
-- `/context-guard rebuild`: rebuild the current session's `guard.sqlite` and `timeline.txt` from canonical `dsh` history.
+- `/context-guard`: show a concise summary of `guard.sqlite` coverage, card/scored counts, latest `p_degraded` scores, intervention/auto-compact counts, and local runtime status.
 
 ## Validation
 

@@ -169,7 +169,7 @@ test('extractCardsFromEvents filters strictly via dsh MessageSourceMap and pairs
   assert.ok(!cards[2].callText.includes('secret internal CoT'))
 })
 
-test('incremental sync, real-time p_degraded scoring, semanticSearch, timeline.txt, and /context-guard rebuild', async t => {
+test('incremental sync, real-time p_degraded scoring, semanticSearch, timeline.txt, and /context-guard status', async t => {
   const { ctx, session, agent, commands, guard, mock } = await fixture(t)
 
   // Turn 1: user + 2 actions (card_idx 2 is action -> triggers judge!)
@@ -215,16 +215,20 @@ test('incremental sync, real-time p_degraded scoring, semanticSearch, timeline.t
   assert.equal(sumRange.cards.length, 3)
   assert.ok(sumRange.throughEventId >= 0)
 
-  // /context-guard status & /context-guard rebuild commands
-  const statusCmd = await commands.get('context-guard').handler({ agent, rawInput: 'status', signal: new AbortController().signal })
+  // /context-guard zero-arg status command (and rejects extra arguments)
+  const statusCmd = await commands.get('context-guard').handler({ agent, rawInput: '', signal: new AbortController().signal })
   assert.equal(statusCmd.kind, 'success')
-  const parsed = JSON.parse(statusCmd.text)
-  assert.equal(parsed.cardCount, 3)
-  assert.equal(parsed.scoredCount, 1)
+  assert.match(statusCmd.text, /^cards 3 \(scored 1, latest p=0\.72\)/)
+  assert.match(statusCmd.text, /recent p_degraded: #2 run_code=0\.72/)
 
-  const rebuildCmd = await commands.get('context-guard').handler({ agent, rawInput: 'rebuild', signal: new AbortController().signal })
-  assert.equal(rebuildCmd.kind, 'success')
-  assert.match(rebuildCmd.text, /Rebuilt guard\.sqlite/)
+  const badArgCmd = await commands.get('context-guard').handler({ agent, rawInput: 'rebuild', signal: new AbortController().signal })
+  assert.equal(badArgCmd.kind, 'error')
+  assert.match(badArgCmd.text, /no arguments/)
+
+  // Programmatic rebuildSession API still rebuilds guard.sqlite cleanly
+  const rebuilt = await guard.rebuildSession(session)
+  assert.equal(rebuilt.cardCount, 3)
+  assert.equal(rebuilt.scoredCount, 1)
   assert.ok(mock.calls.summarize > beforeCalls.summarize)
 
   // Startup asset check must have been triggered automatically on ContextGuardEngine construction
@@ -519,10 +523,9 @@ test('escalates to full-prefix compactRegion on 3rd degradation hit after 2 remi
   assert.equal(compactCalls[0].end, lastToolEv.seq)
 
   // Status reflects autoCompactCount=1 and reset turnCount=0
-  const statusCmd = await commands.get('context-guard').handler({ agent, rawInput: 'status', signal: new AbortController().signal })
-  const parsed = JSON.parse(statusCmd.text)
-  assert.equal(parsed.intervention.count, 2)
-  assert.equal(parsed.intervention.turnCount, 0)
-  assert.equal(parsed.intervention.autoCompactCount, 1)
-  assert.equal(parsed.intervention.pendingCompact, false)
+  const statusCmd = await commands.get('context-guard').handler({ agent, rawInput: '', signal: new AbortController().signal })
+  assert.equal(statusCmd.kind, 'success')
+  assert.match(statusCmd.text, /interventions 2, auto-compact 1/)
+  assert.match(statusCmd.text, /total 2 \(turn 0\), auto-compact 1/)
+  assert.doesNotMatch(statusCmd.text, /auto-compact queued/)
 })

@@ -285,44 +285,58 @@ export class ContextGuardEngine implements ContextGuardApi {
 
     ctx.commands.register({
       name: 'context-guard',
-      description: 'Inspect or rebuild the session context-guard index (guard.sqlite)',
-      handler: async ({ agent, rawInput, signal }) => {
-        const action = rawInput.trim() || 'status'
+      description: 'Show session context-guard status',
+      handler: async ({ agent, rawInput }) => {
+        if (rawInput.trim().length > 0) {
+          return { kind: 'error', text: 'Usage: /context-guard (no arguments)' }
+        }
         if (agent.session.header.origin === 'subagent') {
           return { kind: 'error', text: 'Context guard targets main-agent sessions.' }
         }
-        if (action === 'rebuild') {
-          const st = await this.rebuildSession(agent.session, signal)
-          return {
-            kind: 'success',
-            text: `Rebuilt guard.sqlite through event ${st.throughEventId} (${st.cardCount} cards, ${st.scoredCount} scored actions).`,
-          }
-        }
-        if (action !== 'status') {
-          return { kind: 'error', text: 'Usage: /context-guard [status|rebuild]' }
-        }
         const st = await this.status(agent.session.id)
-        return {
-          kind: 'success',
-          text: JSON.stringify({
-            ...st,
-            intervention: {
-              enabled: this.enableIntervention,
-              policy: this.interventionPolicy,
-              count: this.interventionCounts.get(agent.session.id) ?? 0,
-              turnCount: this.turnInterventionCounts.get(agent.session.id) ?? 0,
-              lastInterventionCardIdx: this.lastInterventionCardIdx.get(agent.session.id) ?? null,
-              pending: this.pendingInterventions.has(agent.session.id),
-              enableAutoCompact: this.enableAutoCompact,
-              interventionsBeforeCompact: this.interventionsBeforeCompact,
-              autoCompactCount: this.autoCompactCounts.get(agent.session.id) ?? 0,
-              pendingCompact: this.pendingCompactions.has(agent.session.id),
-            },
-            runtime: this.inference.status(),
-            startupError: this.startupError,
-            error: this.failures.get(agent.session.id) ?? null,
-          }, null, 2),
+        const totalInterventions = this.interventionCounts.get(agent.session.id) ?? 0
+        const turnInterventions = this.turnInterventionCounts.get(agent.session.id) ?? 0
+        const autoCompacts = this.autoCompactCounts.get(agent.session.id) ?? 0
+        const rt = this.inference.status()
+        const prepare = rt.prepare as { status?: string; activeAsset?: string | null } | undefined
+        const rtState = prepare?.status
+          ? (prepare.activeAsset ? `${prepare.status} (${prepare.activeAsset})` : prepare.status)
+          : 'ready'
+        const serverKeys = ['summarizer', 'embedding', 'judge'] as const
+        const hasServers = serverKeys.some(k => rt[k] !== undefined)
+        const runningServers = serverKeys.filter(k => (rt[k] as { running?: boolean } | undefined)?.running === true).length
+        const latest = st.latestScores.at(-1)
+        const latestPart = latest ? `, latest p=${latest.pDegraded.toFixed(2)}` : ''
+        const err = this.failures.get(agent.session.id) ?? this.startupError
+
+        const summary = [
+          `cards ${st.cardCount} (scored ${st.scoredCount}${latestPart})`,
+          `interventions ${totalInterventions}, auto-compact ${autoCompacts}`,
+          `runtime ${rtState}`,
+          ...(err ? [`error: ${err}`] : []),
+        ].join(' | ')
+
+        const lines = [
+          summary,
+          `indexed: ${st.throughEventId >= 0 ? `event #${st.throughEventId}` : 'none'} (${st.cardCount} cards, ${st.scoredCount}/${st.actionCount} actions scored)`,
+        ]
+        if (st.latestScores.length > 0) {
+          const recent = st.latestScores.slice(-5).map(s => `#${s.cardIdx} ${s.tool}=${s.pDegraded.toFixed(2)}`).join(', ')
+          lines.push(`recent p_degraded: ${recent}`)
         }
+        const policy = this.interventionPolicy
+        const pendingFlags = [
+          ...(this.pendingInterventions.has(agent.session.id) ? ['reminder queued'] : []),
+          ...(this.pendingCompactions.has(agent.session.id) ? ['auto-compact queued'] : []),
+        ]
+        lines.push(
+          `intervention: ${this.enableIntervention ? 'on' : 'off'} (p>=${policy.degradedThreshold.toFixed(2)}, ${policy.hitsToTrigger}/${policy.hitWindowSteps} hits, cooldown ${policy.cooldownSteps}) | total ${totalInterventions} (turn ${turnInterventions}), auto-compact ${autoCompacts}${pendingFlags.length > 0 ? ` [${pendingFlags.join(', ')}]` : ''}`,
+        )
+        lines.push(`runtime: ${rtState}${hasServers ? ` (servers ${runningServers}/3 running)` : ''}`)
+        lines.push(`db: ${st.dbPath}`)
+        if (err) lines.push(`error: ${err}`)
+
+        return { kind: 'success', text: lines.join('\n') }
       },
     })
 

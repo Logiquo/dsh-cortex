@@ -212,8 +212,8 @@ test('multiple compactions and reopening offload.sqlite preserve canonical early
   }
 })
 
-test('corrupt sqlite row prevents replacement even when cache is warm, and /context-offload rebuild repairs it', async t => {
-  const { ctx, agent, session, commands } = await fixture(t)
+test('corrupt sqlite row prevents replacement even when cache is warm, and ArchiveStore.rebuild repairs it', async t => {
+  const { ctx, agent, session } = await fixture(t)
   conversation(session, 1, 'Canonical violet-42 content')
   await ctx.sessions.flush(session)
   const store = ctx.compaction.archives
@@ -234,17 +234,12 @@ test('corrupt sqlite row prevents replacement even when cache is warm, and /cont
   )
   assert.equal(session.surface.replaceGeneration, generation)
 
-  // Session-scoped /context-offload rebuild restores integrity from canonical dsh history
-  const rebuilt = await commands.get('context-offload').handler({
-    agent,
-    rawInput: 'rebuild',
-    signal: new AbortController().signal,
-  })
-  assert.equal(rebuilt.kind, 'success')
-  assert.match(rebuilt.text, /Rebuilt offload\.sqlite/)
+  // Rebuilding from canonical dsh history restores integrity
+  const allEvents = await events(ctx, session)
+  await store.rebuild(session.id, allEvents)
   const verified = await store.verify(session.id)
   assert.ok(verified)
-  assert.equal(verified.throughId, (await events(ctx, session)).length - 1)
+  assert.equal(verified.throughId, allEvents.length - 1)
 })
 
 test('empty output fails on the first attempt without losing context', async t => {
@@ -289,19 +284,19 @@ test('cancellation during brief generation preserves the original surface', asyn
   assert.equal(session.surface.replaceGeneration, 0)
 })
 
-test('ordinary export and /context-offload status do not trigger inference and report dynamic contextWindow', async t => {
+test('ordinary export and /context-offload do not trigger inference and report dynamic contextWindow', async t => {
   const { ctx, agent, session, calls, commands } = await fixture(t, {}, { modelWindows: { model: 128000 } })
   conversation(session, 1, 'A short user request.')
   await ctx.sessions.flush(session)
-  const status = await commands.get('context-offload').handler({ agent, rawInput: 'status', signal: new AbortController().signal })
+  const status = await commands.get('context-offload').handler({ agent, rawInput: '', signal: new AbortController().signal })
   assert.equal(status.kind, 'success')
-  const parsed = JSON.parse(status.text)
-  assert.equal(parsed.provider, 'probe')
-  assert.equal(parsed.model, 'model')
-  assert.equal(parsed.contextWindow, 128000)
-  assert.equal(parsed.thresholdRatio, 0.8)
-  assert.equal(parsed.retainRatio, 0.16)
-  assert.match(parsed.dbPath, /offload\.sqlite$/)
+  assert.match(status.text, /model \(128k, compact @ 80%\)/)
+  assert.match(status.text, /model: probe\/model \(window 128000/)
+  assert.match(status.text, /policy: threshold 80%, retain 16%/)
+  assert.match(status.text, /db: .*offload\.sqlite/)
+  const badArg = await commands.get('context-offload').handler({ agent, rawInput: 'status', signal: new AbortController().signal })
+  assert.equal(badArg.kind, 'error')
+  assert.match(badArg.text, /no arguments/)
   assert.equal(calls.length, 0)
   assert.equal((await ctx.compaction.archives.verify(session.id)).sessionId, session.id)
 })
