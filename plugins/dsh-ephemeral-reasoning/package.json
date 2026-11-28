@@ -1,7 +1,7 @@
 {
   "name": "dsh-ephemeral-reasoning",
   "description": "Show reasoning during generation and save only cleaned main-agent responses.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
