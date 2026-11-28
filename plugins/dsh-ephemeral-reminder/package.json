@@ -38,7 +38,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
-    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.1 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.2.2-rc.5 <0.3.0",
     "dsh-api-request": "^0.1.0"
   },
   "dependencies": {
@@ -55,7 +55,7 @@
   },
   "engines": {
     "node": ">=24.9.0",
-    "dsh": ">=0.2.2-rc.1 <0.3.0"
+    "dsh": ">=0.2.2-rc.5 <0.3.0"
   },
   "publishConfig": {
     "access": "public"

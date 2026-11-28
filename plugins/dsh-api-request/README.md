@@ -65,7 +65,7 @@ When no valid usage anchor exists (or the request envelope / surface is replaced
 
 ## Install & Host Compatibility
 
-Supports **dsh `0.2.2-rc.1`** and **`0.2.2-rc.5`** via the internal host driver registry (`src/drivers/`). On startup, `dsh-api-request` verifies package versions and probes `LlmRuntime.forAdapter` and `TokenMeter.measure` before installing any patch—failing closed without mutating host services if an unrecognized or already-wrapped implementation is detected.
+Supports **dsh `0.2.2-rc.5`** via the internal host driver registry (`src/drivers/`). On startup, `dsh-api-request` verifies package versions and probes `LlmRuntime.forAdapter` and `TokenMeter.measure` before installing any patch—failing closed without mutating host services if an unrecognized or already-wrapped implementation is detected.
 
 ```sh
 npm install

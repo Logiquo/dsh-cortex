@@ -1,6 +1,6 @@
 # dsh-context-offload
 
-Forward-looking compaction briefs, session-scoped SQLite history archives (`offload.sqlite`), and built-in history search/read tools for DeepSeek Harness (`>=0.2.2-rc.1 <0.3.0`).
+Forward-looking compaction briefs, session-scoped SQLite history archives (`offload.sqlite`), and built-in history search/read tools for DeepSeek Harness (`>=0.2.2-rc.5 <0.3.0`).
 
 The plugin subclasses `BasicCompactionEngine`, inheriting its dynamic model-`contextWindow` trigger policy, `toolResultPruner` pre-pruning, model-switch compaction, `context-overflow` recovery, manual `/compact`, tool-pairing balance, and checkpoint transaction format.
 

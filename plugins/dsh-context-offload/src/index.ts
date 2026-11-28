@@ -226,7 +226,7 @@ export class ContextOffloadEngine extends BasicCompactionEngine {
 
     const finish = assembler.finish
     if (finish.kind === 'error' || finish.kind === 'aborted') {
-      throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+      throw LlmError.fromFailure(finish.failure)
     }
     if (finish.kind === 'max-tokens') {
       throw Object.assign(new Error('Execution brief truncated at the token cap (incomplete checkpoint)'), { code: 'MAX_TOKENS' })

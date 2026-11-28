@@ -14,7 +14,7 @@ import { freezeModifiedMessages, type TransformPipeline } from '../pipeline.js'
 import type { DurableMessageDiff } from '../types.js'
 import type { HostDriver, ProbeResult } from './types.js'
 
-const SUPPORTED_VERSIONS = ['0.2.2-rc.1', '0.2.2-rc.5'] as const
+const SUPPORTED_VERSIONS = ['0.2.2-rc.5'] as const
 const PRESSURE_KEY = 'contextPressure'
 const HOST_PRESSURE_VERSION = 5
 const PRESSURE_VERSION = 10

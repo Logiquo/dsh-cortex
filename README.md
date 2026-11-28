@@ -13,7 +13,7 @@ A collection of DeepSeek Harness (`dsh`) plugins designed to improve `dsh`'s per
 
 ## Installation
 
-Requires Node.js **24.9+** and `dsh` (`>=0.2.2-rc.1 <0.3.0`).
+Requires Node.js **24.9+** and `dsh` (`>=0.2.2-rc.5 <0.3.0`).
 
 Build the workspace and add any plugin to a `dsh` profile:
 
