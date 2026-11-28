@@ -1,16 +1,25 @@
 import { spawn, execFile } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { createWriteStream, existsSync, statSync } from 'node:fs'
 import { chmod, mkdir, readFile, rename, unlink } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { dirname, join } from 'node:path'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ReadableStream as WebReadableStream } from 'node:stream/web'
 import { promisify } from 'node:util'
 import type { ExtractedCard } from './cards.js'
 import { buildSummarizerInput, formatMicroCard } from './cards.js'
-import { DEFAULT_HF_ENDPOINT, DEFAULT_HF_MODEL_FILES, DEFAULT_HF_REPO } from './config.js'
+import {
+  DEFAULT_HF_ENDPOINT,
+  DEFAULT_HF_MODEL_FILES,
+  DEFAULT_HF_MODEL_SHA256,
+  DEFAULT_HF_REPO,
+  DEFAULT_HF_REVISION,
+  DEFAULT_LLAMA_ARCHIVE_SHA256,
+  DEFAULT_LLAMA_BUILD,
+} from './config.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -30,7 +39,12 @@ export interface LlamaRuntimeOptions {
   autoDownloadRuntime: boolean
   autoDownloadModels?: boolean
   hfRepo?: string
+  hfRevision?: string
   hfEndpoint?: string
+  /** Optional SHA256 overrides for downloaded model assets (defaults to pinned DEFAULT_HF_MODEL_SHA256). */
+  modelSha256?: Partial<Record<ModelAssetKey, string>>
+  /** Optional SHA256 override for downloaded llama.cpp release archive (defaults to pinned DEFAULT_LLAMA_ARCHIVE_SHA256). */
+  runtimeArchiveSha256?: string
   gpuLayers: number
   summarizerModelPath: string
   summarizerModelCustom?: boolean
@@ -66,7 +80,13 @@ function fileExistsNonEmpty(path: string): boolean {
   }
 }
 
-async function downloadFileAtomic(url: string, destPath: string, signal?: AbortSignal): Promise<void> {
+interface DownloadOptions {
+  signal?: AbortSignal
+  expectedSha256?: string
+}
+
+async function downloadFileAtomic(url: string, destPath: string, options: DownloadOptions = {}): Promise<void> {
+  const { signal, expectedSha256 } = options
   await mkdir(dirname(destPath), { recursive: true, mode: 0o700 })
   const tmpPath = `${destPath}.part-${process.pid}-${Date.now()}`
   try {
@@ -75,10 +95,24 @@ async function downloadFileAtomic(url: string, destPath: string, signal?: AbortS
     if (!res.body) throw new Error(`Empty response body for ${url}`)
     const expectedLen = Number(res.headers.get('content-length') ?? '0')
     const nodeStream = Readable.fromWeb(res.body as unknown as WebReadableStream)
-    await pipeline(nodeStream, createWriteStream(tmpPath), ...(signal ? [{ signal }] : []))
+    const hash = createHash('sha256')
+    const hasher = new Transform({
+      transform(chunk, _encoding, callback) {
+        hash.update(chunk)
+        callback(null, chunk)
+      },
+    })
+    await pipeline(nodeStream, hasher, createWriteStream(tmpPath), ...(signal ? [{ signal }] : []))
     const writtenSize = statSync(tmpPath).size
     if (writtenSize === 0 || (expectedLen > 0 && writtenSize !== expectedLen)) {
       throw new Error(`Incomplete download for ${url}: got ${writtenSize} bytes, expected ${expectedLen}`)
+    }
+    if (expectedSha256 !== undefined) {
+      const actualSha256 = hash.digest('hex')
+      const normalizedExpected = expectedSha256.trim().toLowerCase()
+      if (actualSha256 !== normalizedExpected) {
+        throw new Error(`SHA256 mismatch for ${url}: expected ${normalizedExpected}, got ${actualSha256}`)
+      }
     }
     await rename(tmpPath, destPath)
   } catch (err) {
@@ -375,7 +409,18 @@ export class LlamaGuardRuntime implements GuardInferenceClient {
   private resolveModelDownloadUrl(hfRelPath: string): string {
     const base = (this.opts.hfEndpoint ?? DEFAULT_HF_ENDPOINT).replace(/\/+$/, '')
     const repo = (this.opts.hfRepo ?? DEFAULT_HF_REPO).replace(/^\/+|\/+$/g, '')
-    return `${base}/${repo}/resolve/main/${hfRelPath}`
+    const revision = (this.opts.hfRevision ?? DEFAULT_HF_REVISION).replace(/^\/+|\/+$/g, '')
+    return `${base}/${repo}/resolve/${revision}/${hfRelPath}`
+  }
+
+  private resolveExpectedModelSha256(key: ModelAssetKey): string | undefined {
+    if (this.opts.modelSha256?.[key]) return this.opts.modelSha256[key]
+    const repo = (this.opts.hfRepo ?? DEFAULT_HF_REPO).replace(/^\/+|\/+$/g, '')
+    const revision = (this.opts.hfRevision ?? DEFAULT_HF_REVISION).replace(/^\/+|\/+$/g, '')
+    if (repo === DEFAULT_HF_REPO && revision === DEFAULT_HF_REVISION) {
+      return DEFAULT_HF_MODEL_SHA256[key]
+    }
+    return undefined
   }
 
   private async ensureModelAsset(key: ModelAssetKey, signal?: AbortSignal): Promise<string> {
@@ -395,7 +440,11 @@ export class LlamaGuardRuntime implements GuardInferenceClient {
       this.prepareState.status = 'downloading'
       this.prepareState.activeAsset = spec.label
       const url = this.resolveModelDownloadUrl(spec.hfRelPath)
-      await downloadFileAtomic(url, spec.destPath, signal)
+      const expectedSha256 = this.resolveExpectedModelSha256(key)
+      await downloadFileAtomic(url, spec.destPath, {
+        ...(signal ? { signal } : {}),
+        ...(expectedSha256 ? { expectedSha256 } : {}),
+      })
       return spec.destPath
     })().finally(() => { this.modelPromises.delete(key) })
 
@@ -437,7 +486,14 @@ export class LlamaGuardRuntime implements GuardInferenceClient {
     await mkdir(runtimeDir, { recursive: true, mode: 0o700 })
     const url = `https://github.com/ggml-org/llama.cpp/releases/download/${this.opts.llamaBuild}/${asset.archiveName}`
     const archivePath = join(runtimeDir, asset.archiveName)
-    await downloadFileAtomic(url, archivePath, signal)
+    const expectedSha256 = this.opts.runtimeArchiveSha256 ?? DEFAULT_LLAMA_ARCHIVE_SHA256[asset.archiveName]
+    if (this.opts.llamaBuild === DEFAULT_LLAMA_BUILD && !expectedSha256) {
+      throw new Error(`Missing pinned SHA256 checksum for llama.cpp archive ${asset.archiveName}`)
+    }
+    await downloadFileAtomic(url, archivePath, {
+      ...(signal ? { signal } : {}),
+      ...(expectedSha256 ? { expectedSha256 } : {}),
+    })
 
     if (asset.archiveName.endsWith('.zip')) {
       await execFileAsync('powershell.exe', [

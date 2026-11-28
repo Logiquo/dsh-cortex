@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { test } from 'node:test'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -20,6 +22,7 @@ import {
 import {
   DEFAULT_EMB_MODEL,
   DEFAULT_HF_MODEL_FILES,
+  DEFAULT_HF_REVISION,
   DEFAULT_JUDGE_HEAD,
   DEFAULT_JUDGE_MODEL,
   DEFAULT_LLAMA_BUILD,
@@ -241,24 +244,33 @@ test('incremental sync, real-time p_degraded scoring, semanticSearch, timeline.t
   assert.match(win, /\[CURRENT ACTION ANCHOR \| run_code\]/)
 })
 
-test('LlamaGuardRuntime.ensureReady checks runtime and auto-downloads missing models from HF atomically', async t => {
+test('LlamaGuardRuntime.ensureReady verifies SHA256 on HF models and llama.cpp archive downloads', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'context-guard-dl-'))
   const fakeBin = join(dir, 'llama-server.exe')
   await writeFile(fakeBin, 'stub-binary')
 
+  const sha256Of = buf => createHash('sha256').update(buf).digest('hex')
   const requestedUrls = []
   const baseEndpoint = 'https://mock-hf.local'
+  const embBuf = Buffer.from('FAKE-EMB-GGUF')
+  const sumBuf = Buffer.from('FAKE-SUM-GGUF')
+  const judgeBuf = Buffer.from('FAKE-JUDGE-GGUF')
+  const headBuf = Buffer.from(JSON.stringify({ hidden_size: 4, weight: [0.1, 0.2, 0.3, 0.4], bias: 0.02 }))
   const payloads = {
-    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/main/${DEFAULT_HF_MODEL_FILES.embedding}`]: Buffer.from('FAKE-EMB-GGUF'),
-    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/main/${DEFAULT_HF_MODEL_FILES.summarizer}`]: Buffer.from('FAKE-SUM-GGUF'),
-    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/main/${DEFAULT_HF_MODEL_FILES.judge}`]: Buffer.from('FAKE-JUDGE-GGUF'),
-    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/main/${DEFAULT_HF_MODEL_FILES.judgeHead}`]: Buffer.from(JSON.stringify({ hidden_size: 4, weight: [0.1, 0.2, 0.3, 0.4], bias: 0.02 })),
+    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/${DEFAULT_HF_REVISION}/${DEFAULT_HF_MODEL_FILES.embedding}`]: embBuf,
+    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/${DEFAULT_HF_REVISION}/${DEFAULT_HF_MODEL_FILES.summarizer}`]: sumBuf,
+    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/${DEFAULT_HF_REVISION}/${DEFAULT_HF_MODEL_FILES.judge}`]: judgeBuf,
+    [`${baseEndpoint}/Logic-z/dsh-cortex/resolve/${DEFAULT_HF_REVISION}/${DEFAULT_HF_MODEL_FILES.judgeHead}`]: headBuf,
   }
 
   const origFetch = globalThis.fetch
   globalThis.fetch = async url => {
     const u = String(url)
     requestedUrls.push(u)
+    if (u.startsWith('https://github.com/ggml-org/llama.cpp/releases/download/')) {
+      const tampered = Buffer.from('TAMPERED-ARCHIVE')
+      return new Response(tampered, { status: 200, headers: { 'content-length': String(tampered.length) } })
+    }
     const body = payloads[u]
     if (!body) return new Response('not found', { status: 404 })
     return new Response(body, {
@@ -281,6 +293,12 @@ test('LlamaGuardRuntime.ensureReady checks runtime and auto-downloads missing mo
     autoDownloadModels: true,
     hfRepo: 'Logic-z/dsh-cortex',
     hfEndpoint: baseEndpoint,
+    modelSha256: {
+      embedding: sha256Of(embBuf),
+      summarizer: sha256Of(sumBuf),
+      judge: sha256Of(judgeBuf),
+      judgeHead: sha256Of(headBuf),
+    },
     gpuLayers: 0,
     summarizerModelPath: resolveModelPath(storeRoot, undefined, DEFAULT_SUM_MODEL),
     judgeModelPath: resolveModelPath(storeRoot, undefined, DEFAULT_JUDGE_MODEL),
@@ -288,7 +306,7 @@ test('LlamaGuardRuntime.ensureReady checks runtime and auto-downloads missing mo
     embeddingModelPath: resolveModelPath(storeRoot, undefined, DEFAULT_EMB_MODEL),
   })
 
-  // First ensureReady downloads all 4 missing model files from the mock HF endpoint
+  // First ensureReady downloads all 4 missing model files from the pinned revision and verifies SHA256
   await runtime.ensureReady()
   assert.equal(requestedUrls.length, 4)
   assert.equal(await readFile(resolveModelPath(storeRoot, undefined, DEFAULT_EMB_MODEL), 'utf8'), 'FAKE-EMB-GGUF')
@@ -301,6 +319,42 @@ test('LlamaGuardRuntime.ensureReady checks runtime and auto-downloads missing mo
   // Second ensureReady finds all files already present and performs 0 downloads
   await runtime.ensureReady()
   assert.equal(requestedUrls.length, 4)
+
+  // Tampered model payload fails pinned DEFAULT_HF_MODEL_SHA256 verification and cleans up temp file
+  const tamperedModelRoot = join(dir, 'tampered-model')
+  const tamperedModelRuntime = new LlamaGuardRuntime({
+    storeRoot: tamperedModelRoot,
+    llamaServerPath: fakeBin,
+    llamaBuild: DEFAULT_LLAMA_BUILD,
+    autoDownloadRuntime: false,
+    autoDownloadModels: true,
+    hfRepo: 'Logic-z/dsh-cortex',
+    hfEndpoint: baseEndpoint,
+    gpuLayers: 0,
+    summarizerModelPath: resolveModelPath(tamperedModelRoot, undefined, DEFAULT_SUM_MODEL),
+    judgeModelPath: resolveModelPath(tamperedModelRoot, undefined, DEFAULT_JUDGE_MODEL),
+    judgeHeadPath: resolveModelPath(tamperedModelRoot, undefined, DEFAULT_JUDGE_HEAD),
+    embeddingModelPath: resolveModelPath(tamperedModelRoot, undefined, DEFAULT_EMB_MODEL),
+  })
+  await assert.rejects(() => tamperedModelRuntime.ensureReady(), /SHA256 mismatch/)
+  assert.equal(existsSync(resolveModelPath(tamperedModelRoot, undefined, DEFAULT_EMB_MODEL)), false)
+  assert.deepEqual(await readdir(join(tamperedModelRoot, 'models')), [])
+
+  // Tampered llama.cpp runtime archive fails pinned DEFAULT_LLAMA_ARCHIVE_SHA256 verification before extraction
+  const tamperedBinRoot = join(dir, 'tampered-bin')
+  const tamperedBinRuntime = new LlamaGuardRuntime({
+    storeRoot: tamperedBinRoot,
+    llamaBuild: DEFAULT_LLAMA_BUILD,
+    autoDownloadRuntime: true,
+    autoDownloadModels: false,
+    gpuLayers: 0,
+    summarizerModelPath: resolveModelPath(tamperedBinRoot, undefined, DEFAULT_SUM_MODEL),
+    judgeModelPath: resolveModelPath(tamperedBinRoot, undefined, DEFAULT_JUDGE_MODEL),
+    judgeHeadPath: resolveModelPath(tamperedBinRoot, undefined, DEFAULT_JUDGE_HEAD),
+    embeddingModelPath: resolveModelPath(tamperedBinRoot, undefined, DEFAULT_EMB_MODEL),
+  })
+  await assert.rejects(() => tamperedBinRuntime.ensureReady(), /SHA256 mismatch/)
+  assert.deepEqual(await readdir(join(tamperedBinRoot, 'runtime', DEFAULT_LLAMA_BUILD)), [])
 
   // With autoDownloadModels disabled on an empty store, ensureReady fails cleanly
   const emptyRoot = join(dir, 'empty-cortex')
