@@ -294,12 +294,6 @@ export class ArchiveStore {
     return entry
   }
 
-  /** Fast synchronous check whether this store has already archived events for a session. */
-  hasArchived(sessionId: string): boolean {
-    const entry = this.cache.get(sessionId)
-    return entry !== undefined && entry.throughId >= 0
-  }
-
   async verify(sessionId: string): Promise<ArchiveStatus | undefined> {
     return this.serial(sessionId, async () => {
       const directory = this.sessionDirectory(sessionId)

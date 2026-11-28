@@ -131,7 +131,7 @@ test('portable defaults (~/.dsh/context-cortex), BasicCompactionConfig pass-thro
   assert.equal(briefTargetTokens(200000), 4096)
 })
 
-test('forward-looking brief commits to offload.sqlite (events, events_fts, compact) with tool guidance', async t => {
+test('forward-looking brief commits to offload.sqlite (events, compact) with tool guidance', async t => {
   const { ctx, agent, session, calls } = await fixture(t)
   conversation(session, 1, 'Original exact fact: violet-42.\n' + 'History data\n'.repeat(7000))
   const result = await ctx.compaction.compactNow(agent, new AbortController().signal)

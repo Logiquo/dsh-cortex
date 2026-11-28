@@ -1,8 +1,5 @@
 import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
-import type { RequestMessage } from '@deepseek-ai/dsh-llm'
-import { deriveEventMessage } from '@deepseek-ai/dsh-session'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { resolveHostDriver } from './drivers/registry.js'
 import { TransformPipeline } from './pipeline.js'
 import {
@@ -52,18 +49,6 @@ export class ApiRequest extends Service implements ApiRequestService {
 
   register(transform: RequestTransform): () => void {
     return this.pipeline.register(transform)
-  }
-
-  estimateHiddenTokens(event: SessionEvent, isClosedTurn: boolean): number {
-    const msg = deriveEventMessage(event)
-    if (msg === null) return 0
-    const messages: RequestMessage[] = isClosedTurn
-      ? [msg, { role: 'user', content: [{ type: 'text', text: '' }] }]
-      : [msg]
-    const diff = this.pipeline.run({ messages, purpose: undefined })
-    const d = diff.durableDiffs.get(msg.id)
-    if (d === undefined || d.deltaTokens >= 0) return 0
-    return -d.deltaTokens
   }
 }
 

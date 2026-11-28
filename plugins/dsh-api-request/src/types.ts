@@ -3,7 +3,7 @@ import type {
   MessageId,
   RequestMessage,
 } from '@deepseek-ai/dsh-llm'
-import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 
 export const API_REQUEST_PROTOCOL = 1 as const
 
@@ -63,9 +63,4 @@ export interface ApiRequestService {
   readonly protocolVersion: number
   readonly hostDriver: HostDriverInfo
   register(transform: RequestTransform): () => void
-  /**
-   * Pure helper for Stage 2 projections: estimate hidden tokens for a single
-   * durable event under the currently registered transforms.
-   */
-  estimateHiddenTokens(event: SessionEvent, isClosedTurn: boolean): number
 }
