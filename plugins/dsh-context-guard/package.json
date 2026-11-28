@@ -1,7 +1,7 @@
 {
   "name": "dsh-context-guard",
-  "description": "Local 0.8B context-degradation recorder, scorer, and semantic history search provider for DeepSeek Harness.",
-  "version": "0.1.0",
+  "description": "Local 0.8B context-degradation monitor, intervention/auto-compact guard, and semantic history search provider for DeepSeek Harness.",
+  "version": "0.1.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
