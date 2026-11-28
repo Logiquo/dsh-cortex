@@ -281,8 +281,17 @@ export class ArchiveStore {
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const dbPath = join(directory, OFFLOAD_DB_FILE)
     const db = new DatabaseSync(dbPath)
-    initSchema(db, sessionId)
-    const meta = readMeta(db)
+    let meta: Map<string, string>
+    try {
+      initSchema(db, sessionId)
+      meta = readMeta(db)
+      if (meta.get('schema_version') !== SCHEMA_VERSION) {
+        throw new Error(`Unsupported offload schema_version: ${meta.get('schema_version') ?? 'missing'}`)
+      }
+    } catch (err) {
+      try { db.close() } catch { /* ignore */ }
+      throw err
+    }
     const entry: CachedSession = {
       db,
       dbPath,

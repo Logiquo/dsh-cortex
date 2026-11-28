@@ -32,6 +32,8 @@ export interface GuardInferenceClient {
   dispose(): Promise<void>
 }
 
+export const DEFAULT_INFERENCE_TIMEOUT_MS = 60_000
+
 export interface LlamaRuntimeOptions {
   storeRoot: string
   llamaServerPath?: string
@@ -45,6 +47,8 @@ export interface LlamaRuntimeOptions {
   modelSha256?: Partial<Record<ModelAssetKey, string>>
   /** Optional SHA256 override for downloaded llama.cpp release archive (defaults to pinned DEFAULT_LLAMA_ARCHIVE_SHA256). */
   runtimeArchiveSha256?: string
+  /** Per-request timeout in ms for summarize, embed, and judge calls (defaults to 60_000). */
+  inferenceTimeoutMs?: number
   gpuLayers: number
   summarizerModelPath: string
   summarizerModelCustom?: boolean
@@ -259,7 +263,15 @@ class ManagedLlamaServer {
 
         let healthy = false
         for (let i = 0; i < 100; i++) {
+          if (signal?.aborted) {
+            try { proc.kill('SIGKILL') } catch { /* ignore */ }
+            signal.throwIfAborted()
+          }
           await new Promise(r => setTimeout(r, 250))
+          if (signal?.aborted) {
+            try { proc.kill('SIGKILL') } catch { /* ignore */ }
+            signal.throwIfAborted()
+          }
           if (proc.exitCode !== null) {
             throw new Error(`llama-server (${this.role}, ngl=${ngl}) exited ${proc.exitCode}: ${errTail}`)
           }
@@ -314,8 +326,10 @@ export class LlamaGuardRuntime implements GuardInferenceClient {
   private readonly sumServer: ManagedLlamaServer
   private readonly embServer: ManagedLlamaServer
   private readonly judgeServer: ManagedLlamaServer
+  private readonly inferenceTimeoutMs: number
 
   constructor(private readonly opts: LlamaRuntimeOptions) {
+    this.inferenceTimeoutMs = opts.inferenceTimeoutMs ?? DEFAULT_INFERENCE_TIMEOUT_MS
     this.modelAssets = {
       embedding: {
         key: 'embedding',
@@ -529,15 +543,42 @@ export class LlamaGuardRuntime implements GuardInferenceClient {
     return parsed
   }
 
+  private async postJson(
+    server: ManagedLlamaServer,
+    url: string,
+    body: unknown,
+    label: string,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const timeoutMs = this.inferenceTimeoutMs
+    const timeoutSignal = AbortSignal.timeout(timeoutMs)
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        signal: combinedSignal,
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) throw new Error(`${label} HTTP ${res.status}: ${await res.text()}`)
+      return await res.json()
+    } catch (err) {
+      if (timeoutSignal.aborted && !signal?.aborted) {
+        await server.stop()
+        throw new Error(`${label} inference timed out after ${timeoutMs}ms`)
+      }
+      throw err
+    }
+  }
+
   async summarize(card: ExtractedCard, signal?: AbortSignal): Promise<string> {
     if (card.kind === 'constraint') return formatMicroCard(card, '')
     const base = await this.sumServer.ensureUrl(signal)
     const spec = buildSummarizerInput(card)
-    const res = await fetch(`${base}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      ...(signal ? { signal } : {}),
-      body: JSON.stringify({
+    const j = (await this.postJson(
+      this.sumServer,
+      `${base}/v1/chat/completions`,
+      {
         messages: [
           { role: 'system', content: spec.system },
           { role: 'user', content: spec.user },
@@ -545,24 +586,23 @@ export class LlamaGuardRuntime implements GuardInferenceClient {
         max_tokens: spec.maxTokens,
         temperature: 0,
         chat_template_kwargs: { enable_thinking: false },
-      }),
-    })
-    if (!res.ok) throw new Error(`Summarizer HTTP ${res.status}: ${await res.text()}`)
-    const j = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
+      },
+      'Summarizer',
+      signal,
+    )) as { choices?: Array<{ message?: { content?: string } }> }
     const content = j.choices?.[0]?.message?.content ?? ''
     return formatMicroCard(card, content)
   }
 
   async embed(text: string, signal?: AbortSignal): Promise<Float32Array> {
     const base = await this.embServer.ensureUrl(signal)
-    const res = await fetch(`${base}/v1/embeddings`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      ...(signal ? { signal } : {}),
-      body: JSON.stringify({ input: [text.slice(0, 1024)] }),
-    })
-    if (!res.ok) throw new Error(`Embedding HTTP ${res.status}: ${await res.text()}`)
-    const j = (await res.json()) as { data?: Array<{ embedding?: number[] }> }
+    const j = (await this.postJson(
+      this.embServer,
+      `${base}/v1/embeddings`,
+      { input: [text.slice(0, 1024)] },
+      'Embedding',
+      signal,
+    )) as { data?: Array<{ embedding?: number[] }> }
     const vec = j.data?.[0]?.embedding
     if (!Array.isArray(vec) || vec.length === 0) throw new Error('Empty embedding vector returned')
     return normalizeL2(vec)
@@ -570,14 +610,13 @@ export class LlamaGuardRuntime implements GuardInferenceClient {
 
   async judge(prompt: string, signal?: AbortSignal): Promise<number> {
     const [base, head] = await Promise.all([this.judgeServer.ensureUrl(signal), this.loadHead(signal)])
-    const res = await fetch(`${base}/embedding`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      ...(signal ? { signal } : {}),
-      body: JSON.stringify({ content: prompt }),
-    })
-    if (!res.ok) throw new Error(`Judge HTTP ${res.status}: ${await res.text()}`)
-    const j = (await res.json()) as unknown
+    const j = await this.postJson(
+      this.judgeServer,
+      `${base}/embedding`,
+      { content: prompt },
+      'Judge',
+      signal,
+    )
     let vec: number[] | undefined
     if (Array.isArray(j) && j[0]?.embedding) {
       vec = Array.isArray(j[0].embedding[0]) ? j[0].embedding[0] : j[0].embedding

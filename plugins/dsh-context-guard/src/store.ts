@@ -166,7 +166,16 @@ export class GuardStore {
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const dbPath = join(directory, GUARD_DB_FILE)
     const db = new DatabaseSync(dbPath)
-    initSchema(db, sessionId)
+    try {
+      initSchema(db, sessionId)
+      const verRow = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | undefined
+      if (verRow?.value !== SCHEMA_VERSION) {
+        throw new Error(`Unsupported guard schema_version: ${verRow?.value ?? 'missing'}`)
+      }
+    } catch (err) {
+      try { db.close() } catch { /* ignore */ }
+      throw err
+    }
     const entry: CachedGuardDb = { db, dbPath, directory }
     this.cache.set(sessionId, entry)
     return entry

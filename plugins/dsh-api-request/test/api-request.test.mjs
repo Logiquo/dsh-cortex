@@ -242,3 +242,24 @@ test('message diff metering handles regex text reduction and ephemeral injection
   undoRemind()
   await dispose()
 })
+
+test('startup does not block when contextPressure projection is absent', async () => {
+  const ctx = new Context()
+  const projections = ctx.plugin(SessionProjectionRegistry)
+  await projections.await()
+  const meterFiber = ctx.plugin(TokenMeter)
+  await meterFiber.await()
+  // Remove contextPressure registration to simulate a host without pressure projection
+  ctx.sessionProjections.registrations.delete('contextPressure')
+  new LlmRuntime(ctx)
+
+  const t0 = Date.now()
+  const apiFiber = ctx.plugin(apiRequestPlugin)
+  await apiFiber.await()
+  const elapsed = Date.now() - t0
+  assert.ok(elapsed < 1000, `Expected non-blocking startup (<1000ms), got ${elapsed}ms`)
+
+  await apiFiber.dispose()
+  await meterFiber.dispose()
+  await projections.dispose()
+})

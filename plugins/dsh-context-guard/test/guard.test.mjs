@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { Context } from '@deepseek-ai/cordis'
 import { SessionStore, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
@@ -13,6 +14,7 @@ import { createUserMessage, createAssistantMessage } from '@deepseek-ai/dsh-llm'
 import {
   Config,
   ContextGuardEngine,
+  GuardStore,
   LlamaGuardRuntime,
   extractCardsFromEvents,
   buildS3Window,
@@ -582,4 +584,64 @@ test('escalates to full-prefix compactRegion on 3rd degradation hit after 2 remi
   assert.match(statusCmd.text, /interventions 2, auto-compact 1/)
   assert.match(statusCmd.text, /total 2 \(turn 0\), auto-compact 1/)
   assert.doesNotMatch(statusCmd.text, /auto-compact queued/)
+})
+
+test('LlamaGuardRuntime enforces per-request inference timeout and stops hung server', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'context-guard-timeout-'))
+  const origFetch = globalThis.fetch
+  t.after(async () => {
+    globalThis.fetch = origFetch
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const headPath = join(dir, 'head.json')
+  await writeFile(headPath, JSON.stringify({ hidden_size: 2, weight: [0.5, 0.5], bias: 0 }))
+
+  const runtime = new LlamaGuardRuntime({
+    storeRoot: dir,
+    llamaBuild: DEFAULT_LLAMA_BUILD,
+    autoDownloadRuntime: false,
+    autoDownloadModels: false,
+    inferenceTimeoutMs: 60,
+    gpuLayers: 0,
+    summarizerModelPath: join(dir, 'sum.gguf'),
+    judgeModelPath: join(dir, 'judge.gguf'),
+    judgeHeadPath: headPath,
+    embeddingModelPath: join(dir, 'emb.gguf'),
+  })
+
+  const stopped = []
+  for (const key of ['sumServer', 'embServer', 'judgeServer']) {
+    runtime[key].ensureUrl = async () => 'http://127.0.0.1:19999'
+    runtime[key].stop = async () => { stopped.push(key) }
+  }
+
+  globalThis.fetch = (_url, init) => new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(init.signal.reason ?? new Error('aborted')), { once: true })
+  })
+
+  const actionCard = {
+    cardIdx: 0, startEventId: 0, endEventId: 1, kind: 'action',
+    tool: 'run_code', callText: 'cmd', resText: 'out', compactBefore: false,
+  }
+  await assert.rejects(() => runtime.summarize(actionCard), /Summarizer inference timed out after 60ms/)
+  await assert.rejects(() => runtime.embed('hello'), /Embedding inference timed out after 60ms/)
+  await assert.rejects(() => runtime.judge('prompt'), /Judge inference timed out after 60ms/)
+  assert.deepEqual(stopped, ['sumServer', 'embServer', 'judgeServer'])
+})
+
+test('GuardStore rejects unsupported schema_version on open', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'context-guard-schema-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+
+  const store = new GuardStore(dir, false)
+  const sid = 'schema-mismatch-session'
+  await store.getStatus(sid)
+  store.close(sid)
+
+  const db = new DatabaseSync(store.dbPathFor(sid))
+  db.prepare("UPDATE meta SET value = '999' WHERE key = 'schema_version'").run()
+  db.close()
+
+  await assert.rejects(() => store.loadCards(sid), /Unsupported guard schema_version: 999/)
 })

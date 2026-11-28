@@ -362,11 +362,16 @@ export class ContextGuardEngine implements ContextGuardApi {
     return this.processSession(session, true, signal)
   }
 
+  private combineShutdownSignal(signal?: AbortSignal): AbortSignal {
+    return signal ? AbortSignal.any([signal, this.shutdownController.signal]) : this.shutdownController.signal
+  }
+
   private async processSession(session: Session, forceRebuild: boolean, signal?: AbortSignal): Promise<GuardSessionStatus> {
+    const effectiveSignal = this.combineShutdownSignal(signal)
     try {
       const observation = await this.ctx.sessionQuery.observeSession(session.id, {
         projectionMode: 'none',
-        ...(signal ? { signal } : {}),
+        signal: effectiveSignal,
       })
       let eventsSnapshot
       try {
@@ -395,13 +400,13 @@ export class ContextGuardEngine implements ContextGuardApi {
 
       const working: StoredCard[] = prev.cards.slice(0, reuseLen)
       for (let i = reuseLen; i < extracted.length; i++) {
-        signal?.throwIfAborted()
+        effectiveSignal.throwIfAborted()
         const card = extracted[i]!
-        const micro = await this.inference.summarize(card, signal)
+        const micro = await this.inference.summarize(card, effectiveSignal)
         const embText = card.kind === 'constraint'
           ? card.callText.replace(/\s+/g, ' ').trim().slice(0, 512)
           : micro
-        const embedding = await this.inference.embed(embText, signal)
+        const embedding = await this.inference.embed(embText, effectiveSignal)
 
         const stored: StoredCard = {
           ...card,
@@ -415,7 +420,7 @@ export class ContextGuardEngine implements ContextGuardApi {
         // Score every action card (t >= 2) using exact V2.4 S3_32+32 window (passive recording only).
         if (card.kind === 'action' && i >= 2) {
           const prompt = buildS3Window(working, i)
-          stored.pDegraded = await this.inference.judge(prompt, signal)
+          stored.pDegraded = await this.inference.judge(prompt, effectiveSignal)
         }
       }
 
@@ -478,7 +483,7 @@ export class ContextGuardEngine implements ContextGuardApi {
     query: string,
     options: { topK: number; fromId?: number; toId?: number; signal?: AbortSignal },
   ): Promise<SemanticSearchHit[]> {
-    const queryVec = await this.inference.embed(query, options.signal)
+    const queryVec = await this.inference.embed(query, this.combineShutdownSignal(options.signal))
     return this.store.semanticSearch(sessionId, queryVec, {
       topK: options.topK,
       ...(options.fromId !== undefined ? { fromId: options.fromId } : {}),

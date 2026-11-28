@@ -49,18 +49,50 @@ function checkVersions(): string | undefined {
   return undefined
 }
 
-async function waitForPressureRegistry(ctx: Context): Promise<unknown> {
-  const deadline = Date.now() + 30_000
-  while (true) {
-    const registry = ctx.get('sessionProjections') as unknown
-    if (
-      registry !== undefined &&
-      (registry as { registrations?: Map<string, unknown> }).registrations?.has(PRESSURE_KEY) === true
-    ) {
-      return registry
+const PRESSURE_WATCH_INTERVAL_MS = 25
+const PRESSURE_WATCH_TIMEOUT_MS = 5_000
+
+function findPressureRegistry(ctx: Context): unknown {
+  const registry = ctx.get('sessionProjections') as unknown
+  if (
+    registry !== undefined &&
+    (registry as { registrations?: Map<string, unknown> }).registrations?.has(PRESSURE_KEY) === true
+  ) {
+    return registry
+  }
+  return undefined
+}
+
+function watchPressureRegistry(ctx: Context, pipeline: TransformPipeline): () => void {
+  let disposed = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let pressureUndo: (() => void) | undefined
+  const deadline = Date.now() + PRESSURE_WATCH_TIMEOUT_MS
+
+  const poll = () => {
+    timer = undefined
+    if (disposed) return
+    const registry = findPressureRegistry(ctx)
+    if (registry !== undefined) {
+      pressureUndo = installPressureProjection(registry, pipeline)
+      return
     }
-    if (Date.now() >= deadline) return undefined
-    await new Promise(resolve => setTimeout(resolve, 4))
+    if (Date.now() >= deadline) return
+    timer = setTimeout(poll, PRESSURE_WATCH_INTERVAL_MS)
+    timer.unref()
+  }
+
+  timer = setTimeout(poll, PRESSURE_WATCH_INTERVAL_MS)
+  timer.unref()
+
+  return () => {
+    disposed = true
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      timer = undefined
+    }
+    pressureUndo?.()
+    pressureUndo = undefined
   }
 }
 
@@ -405,11 +437,13 @@ export const dsh022Rc5Driver: HostDriver = {
     )
     undos.push(() => { activeMeter = false })
 
-    // 3. Patch contextPressure projection if present
-    const registry = await waitForPressureRegistry(ctx)
-    if (registry !== undefined) {
-      const pressureUndo = installPressureProjection(registry, pipeline)
+    // 3. Patch contextPressure projection if present (non-blocking watch if registered late)
+    const immediateRegistry = findPressureRegistry(ctx)
+    if (immediateRegistry !== undefined) {
+      const pressureUndo = installPressureProjection(immediateRegistry, pipeline)
       if (pressureUndo) undos.push(pressureUndo)
+    } else {
+      undos.push(watchPressureRegistry(ctx, pipeline))
     }
 
     return () => {

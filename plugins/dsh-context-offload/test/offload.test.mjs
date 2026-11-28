@@ -518,3 +518,19 @@ test('history_search and history_read query offload.sqlite and support hybrid se
     /toId/,
   )
 })
+
+test('ArchiveStore rejects unsupported schema_version on open', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'context-offload-schema-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+
+  const archive = new ArchiveStore(dir)
+  const sid = 'schema-mismatch-session'
+  await archive.getEventCount(sid)
+  archive.close(sid)
+
+  const db = new DatabaseSync(archive.dbPathFor(sid))
+  db.prepare("UPDATE meta SET value = '999' WHERE key = 'schema_version'").run()
+  db.close()
+
+  await assert.rejects(() => archive.getEventCount(sid), /Unsupported offload schema_version: 999/)
+})
